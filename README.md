@@ -54,6 +54,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | `notify` | `true`                   | Queue a note when a worker is done, failed, or blocked |
 | `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
 | `herdr`  | `$HERDR_BIN_PATH` or `~/.local/bin/herdr` | Herdr binary used to open worker spaces; `false` keeps workers headless |
+| `model`  | the spawning session's model | Worker model as `providerID/modelID`. Workers never fall back to OpenCode's free models unless you pick one |
 
 ## Sending captures
 

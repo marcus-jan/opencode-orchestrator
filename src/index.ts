@@ -22,6 +22,8 @@ export interface Options {
   worktree: boolean
   /** Herdr binary used to open every worker in its own space, or false to keep workers headless. */
   herdr: string | false
+  /** Model for workers as "providerID/modelID"; defaults to the model of the session that spawns them. */
+  model?: { providerID: string; id: string }
 }
 
 export function parseOptions(raw: unknown, fallbackHome: string): Options {
@@ -36,7 +38,11 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
   if (options.herdr !== undefined && options.herdr !== false && typeof options.herdr !== "string") {
     throw new Error(`${ID}: option "herdr" must be a string or false`)
   }
+  const model = pick<string | undefined>("model", "string", undefined)
+  const slash = model?.indexOf("/") ?? -1
+  if (model !== undefined && slash < 1) throw new Error(`${ID}: option "model" must look like "providerID/modelID"`)
   return {
+    model: model ? { providerID: model.slice(0, slash), id: model.slice(slash + 1) } : undefined,
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
     notify: pick("notify", "boolean", true),
@@ -210,7 +216,7 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { namespace: ID },
-        execute: async (raw) => {
+        execute: async (raw, context) => {
           const input = raw as Record<string, unknown>
           const title = str(input.title, "title")!
           const prompt = str(input.prompt, "prompt")!
@@ -250,9 +256,12 @@ export default Plugin.define({
 
           // Without herdr, fall back to an OpenCode-managed worktree for project workers.
           const headlessTree = !!branch && !space
+          // Without an explicit model a worker falls back to OpenCode's free models, so inherit the caller's.
+          const model = options.model ?? (await ctx.session.get({ sessionID: context.sessionID }).catch(() => undefined))?.model
           const session = await ctx.session.create({
             title,
             agent,
+            model,
             location: { directory: headlessTree ? root! : directory },
             metadata: { orchestrator: orchestratorID ?? null },
           })

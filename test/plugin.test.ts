@@ -74,7 +74,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
     },
     session: {
       create: record("create", () => ({ id: `ses_${++next}`, projectID: "prj_1" })),
-      get: record("get"),
+      get: record("get", (input) => ({ id: input.sessionID, model: { id: "opus", providerID: "anthropic" } })),
       update: record("update"),
       move: record("move"),
       prompt: record("prompt"),
@@ -87,7 +87,11 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
     command: { transform: async () => {} },
     tool: {
       transform: async (fn: (editor: any) => void) =>
-        fn({ namespace: () => {}, add: (tool: any) => tools.set(tool.name, tool) }),
+        fn({
+          namespace: () => {},
+          add: (tool: any) =>
+            tools.set(tool.name, { ...tool, execute: (input: unknown) => tool.execute(input, { sessionID: "ses_1" }) }),
+        }),
     },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => ({
@@ -119,6 +123,11 @@ test("parseOptions resolves defaults and validates types", () => {
   expect(parseOptions({ herdr: false }, "/home").herdr).toBe(false)
   expect(() => parseOptions({ notify: "yes" }, "/home")).toThrow('option "notify" must be a boolean')
   expect(() => parseOptions({ herdr: 1 }, "/home")).toThrow('option "herdr" must be a string or false')
+  expect(parseOptions({ model: "claude-local/claude-opus-5-5" }, "/home").model).toEqual({
+    providerID: "claude-local",
+    id: "claude-opus-5-5",
+  })
+  expect(() => parseOptions({ model: "opus" }, "/home")).toThrow('option "model" must look like')
 })
 
 test("stays inactive outside its home directory", async () => {
@@ -160,6 +169,7 @@ test("opens project workers as a herdr worktree space nested under the repo", as
     "herdr", "agent", "start", "fix-login", "--kind", "opencode", "--pane", "w10:p1", "--timeout", "90000", "--", "--session", "ses_2",
   ])
   expect(created(calls)[0].input.location).toEqual({ directory: worktree })
+  expect(created(calls)[0].input.model).toEqual({ id: "opus", providerID: "anthropic" })
   expect(calls.some((c) => c.method === "worktree" || c.method === "move")).toBe(false)
   expect(calls.find((c) => c.method === "prompt")?.input).toEqual({ sessionID: "ses_2", text: "do it" })
   const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_2")?.input.value
