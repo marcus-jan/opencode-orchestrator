@@ -4,6 +4,10 @@ export interface Worker {
   id: string
   title: string
   directory: string
+  /** Git project root the worker belongs to, when it was spawned inside one. */
+  project?: string
+  /** Worktree name, when the worker was given its own worktree. */
+  worktree?: string
   state: WorkerState
   detail?: string
   created: number
@@ -82,7 +86,8 @@ export function board(registry: Registry, now = Date.now()) {
     .map((w) => {
       const age = formatAge(now - w.updated)
       const detail = w.detail ? ` (${w.detail})` : ""
-      return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory} — ${age} ago${detail}`
+      const tree = w.worktree ? ` [worktree ${w.worktree}]` : ""
+      return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory}${tree} — ${age} ago${detail}`
     })
     .join("\n")
 }

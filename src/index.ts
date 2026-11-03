@@ -1,5 +1,6 @@
 import path from "node:path"
 import { Plugin } from "@opencode/plugin"
+import { findProjects, gitRoot, slug } from "./projects"
 import { apply, board, EVENT_TYPES, NOTIFY_STATES, transitionFor, type Registry, type Worker } from "./registry"
 
 const ID = "orchestrator"
@@ -14,6 +15,8 @@ export interface Options {
   title: string
   /** Post a synthetic message to the orchestrator when a worker finishes, fails, or blocks. */
   notify: boolean
+  /** Give workers spawned inside a git project their own worktree unless the call says otherwise. */
+  worktree: boolean
 }
 
 export function parseOptions(raw: unknown, fallbackHome: string): Options {
@@ -28,6 +31,7 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
     notify: pick("notify", "boolean", true),
+    worktree: pick("worktree", "boolean", true),
   }
 }
 
@@ -60,8 +64,14 @@ export default Plugin.define({
 
     const publish = async () => {
       if (!orchestratorID) return
+      const projects = await findProjects(options.home)
+      const value = [
+        `Git projects under ${options.home} (spawn_worker "project"): ${projects.join(", ") || "none"}`,
+        `Workers get their own worktree by default: ${options.worktree ? "yes" : "no"}`,
+        `Worker sessions you spawned:\n${board(registry)}`,
+      ].join("\n\n")
       await ctx.session.instructions.entry
-        .put({ sessionID: orchestratorID, key: BOARD_KEY, value: `Worker sessions you spawned:\n${board(registry)}` })
+        .put({ sessionID: orchestratorID, key: BOARD_KEY, value })
         .catch((error: unknown) => console.warn(`[${ID}]`, "failed to publish board", error))
     }
 
@@ -115,15 +125,37 @@ export default Plugin.define({
     await ctx.tool.transform((editor) => {
       editor.namespace({ name: ID, description: "Spawn and track worker OpenCode sessions" })
       editor.add({
+        name: "list_projects",
+        description: `List the git projects (folders under ${options.home}) that workers can be spawned in.`,
+        input: { type: "object", properties: {}, additionalProperties: false },
+        options: { namespace: ID },
+        execute: async () => {
+          const projects = await findProjects(options.home)
+          return { content: projects.length ? projects.map((name) => `- ${name}`).join("\n") : "No git projects found." }
+        },
+      })
+      editor.add({
         name: "spawn_worker",
         description:
-          "Start a new OpenCode worker session in a directory with an initial prompt. The worker runs independently; its status appears on your worker board.",
+          "Start a new OpenCode worker session with an initial prompt, optionally in its own git worktree of a project. The worker runs independently; its status appears on your worker board.",
         input: {
           type: "object",
           properties: {
             title: { type: "string", description: "Short title for the worker session" },
             prompt: { type: "string", description: "Full task for the worker; it has no other context" },
-            directory: { type: "string", description: `Absolute directory to work in (default ${options.home})` },
+            project: {
+              type: "string",
+              description: `Project folder under ${options.home} (see list_projects), e.g. "rate.com"`,
+            },
+            directory: {
+              type: "string",
+              description: "Subdirectory inside the project (or relative to the orchestrator home when no project)",
+            },
+            worktree: {
+              type: ["boolean", "string"],
+              description: `Give the worker its own git worktree: true (named from the title) or a name. Default ${options.worktree}`,
+            },
+            base: { type: "string", description: "Starting ref for the worktree (default: the project's current HEAD)" },
             agent: { type: "string", description: "Agent to run (default: the configured default agent)" },
           },
           required: ["title", "prompt"],
@@ -134,21 +166,49 @@ export default Plugin.define({
           const input = raw as Record<string, unknown>
           const title = str(input.title, "title")!
           const prompt = str(input.prompt, "prompt")!
-          const directory = path.resolve(options.home, str(input.directory, "directory", false) ?? ".")
+          const project = str(input.project, "project", false)
           const agent = str(input.agent, "agent", false)
+          const base = str(input.base, "base", false)
+          const anchor = project ? path.resolve(options.home, project) : options.home
+          const target = path.resolve(anchor, str(input.directory, "directory", false) ?? ".")
+          const root = await gitRoot(target)
+          if (project && !root) throw new Error(`"${project}" is not a git project under ${options.home}`)
+
+          // The configured default only applies inside a git project; an explicit request must have one.
+          const wanted = input.worktree === undefined ? options.worktree && !!root : input.worktree
+          if (typeof wanted !== "boolean" && typeof wanted !== "string") throw new Error(`"worktree" must be a boolean or string`)
+          const worktreeName = wanted === false ? undefined : slug(wanted === true ? title : wanted)
+          if (worktreeName && !root) throw new Error(`a worktree needs a git project; ${target} is not inside one`)
+
           return enqueue(async () => {
             const session = await ctx.session.create({
               title,
               agent,
-              location: { directory },
+              location: { directory: worktreeName ? root! : target },
               metadata: { orchestrator: orchestratorID ?? null },
             })
+            let directory = target
+            if (worktreeName) {
+              const created = await ctx.worktree.create({ projectID: session.projectID, name: worktreeName, branch: base })
+              directory = path.join(created.directory, path.relative(root!, target))
+              await ctx.session.move({ sessionID: session.id, directory })
+            }
             const now = Date.now()
-            registry[session.id] = { id: session.id, title, directory, state: "queued", created: now, updated: now }
+            registry[session.id] = {
+              id: session.id,
+              title,
+              directory,
+              project: root,
+              worktree: worktreeName,
+              state: "queued",
+              created: now,
+              updated: now,
+            }
             await save()
             await ctx.session.prompt({ sessionID: session.id, text: prompt })
             await publish()
-            return { content: `Spawned worker "${title}" as ${session.id} in ${directory}.` }
+            const where = worktreeName ? `worktree "${worktreeName}" at ${directory}` : directory
+            return { content: `Spawned worker "${title}" as ${session.id} in ${where}.` }
           })
         },
       })

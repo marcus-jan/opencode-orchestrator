@@ -8,7 +8,10 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
 
 - On startup, the plugin creates (or reuses) a session titled **Orchestrator** in `home`.
 - The orchestrator gets these tools:
-  - `spawn_worker` creates a session in any directory and sends it the task
+  - `list_projects` lists the git repos directly under `home` (also shown in the orchestrator's context)
+  - `spawn_worker` creates a session for a `project` (optionally a `directory` inside it) and sends it
+    the task. Inside a git project the worker gets its own OpenCode worktree by default, named from the
+    title (`worktree: "name"` to choose, `false` to work in place, `base` for the starting ref)
   - `list_workers` shows the board
   - `message_worker` sends a follow-up (queued, or `steer` to interject)
   - `forget_worker` stops tracking a worker
@@ -35,6 +38,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | `home`   | the plugin's location    | Directory the orchestrator session lives in          |
 | `title`  | `"Orchestrator"`         | Title for the orchestrator session                   |
 | `notify` | `true`                   | Queue a note when a worker is done, failed, or blocked |
+| `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
 
 ## Sending captures
 
