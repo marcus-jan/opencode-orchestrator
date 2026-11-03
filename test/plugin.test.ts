@@ -1,5 +1,5 @@
 import { afterAll, afterEach, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { runtime } from "../src/herdr"
@@ -7,9 +7,13 @@ import plugin, { parseOptions } from "../src/index"
 
 const home = mkdtempSync(path.join(tmpdir(), "orchestrator-"))
 mkdirSync(path.join(home, "web", ".git"), { recursive: true })
+writeFileSync(path.join(home, "web", ".git", "HEAD"), "ref: refs/heads/develop\n")
 mkdirSync(path.join(home, "web", "packages", "ui"), { recursive: true })
-mkdirSync(path.join(home, "api", ".git"), { recursive: true })
+mkdirSync(path.join(home, "api"), { recursive: true })
+writeFileSync(path.join(home, "api", ".git"), "gitdir: /elsewhere\n")
 mkdirSync(path.join(home, "notes"), { recursive: true })
+// A stray tool folder (e.g. GitKraken's .git/gk) must not make home look like a repo
+mkdirSync(path.join(home, ".git", "gk"), { recursive: true })
 afterAll(() => rmSync(home, { recursive: true, force: true }))
 
 const realExec = runtime.exec

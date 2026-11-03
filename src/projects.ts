@@ -3,13 +3,21 @@ import path from "node:path"
 
 const exists = (file: string) => stat(file).then(() => true, () => false)
 
+/** A real checkout: `.git` is a worktree pointer file or a directory with HEAD (not e.g. a stray GitKraken `.git/gk`). */
+async function isRepo(directory: string) {
+  const dotgit = path.join(directory, ".git")
+  const info = await stat(dotgit).catch(() => undefined)
+  if (!info) return false
+  return info.isFile() || exists(path.join(dotgit, "HEAD"))
+}
+
 /** Git repositories that are immediate children of `home`, by folder name. */
 export async function findProjects(home: string) {
   const entries = await readdir(home, { withFileTypes: true }).catch(() => [])
   const names = await Promise.all(
     entries
       .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-      .map(async (entry) => ((await exists(path.join(home, entry.name, ".git"))) ? entry.name : undefined)),
+      .map(async (entry) => ((await isRepo(path.join(home, entry.name))) ? entry.name : undefined)),
   )
   return names.filter((name): name is string => !!name).sort((a, b) => a.localeCompare(b))
 }
@@ -18,7 +26,7 @@ export async function findProjects(home: string) {
 export async function gitRoot(directory: string) {
   let current = path.resolve(directory)
   while (true) {
-    if (await exists(path.join(current, ".git"))) return current
+    if (await isRepo(current)) return current
     const parent = path.dirname(current)
     if (parent === current) return undefined
     current = parent
