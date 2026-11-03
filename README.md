@@ -9,9 +9,17 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
 - On startup, the plugin creates (or reuses) a session titled **Orchestrator** in `home`.
 - The orchestrator gets these tools:
   - `list_projects` lists the git repos directly under `home` (also shown in the orchestrator's context)
-  - `spawn_worker` creates a session for a `project` (optionally a `directory` inside it) and sends it
-    the task. Inside a git project the worker gets its own OpenCode worktree by default, named from the
-    title (`worktree: "name"` to choose, `false` to work in place, `base` for the starting ref)
+  - `spawn_worker` starts a worker for an idea and sends it the task, always in the background:
+    - **Project ideas** (`project`, optional `directory` inside it): creates a new `branch` off `develop`
+      (`master` for `hotfix/` branches; falls back to `master`/`main` when there's no `develop`; `base`
+      overrides). It opens the branch with `herdr worktree create` as a space nested under the repo's
+      existing space, then attaches OpenCode to the new session in that space. `worktree: false` works in
+      the checkout instead.
+    - **Other ideas** (no `project`): a new herdr space in `home`, running a fresh OpenCode session.
+    - The orchestrator picks the title (space label) and branch name itself, following the repo's
+      convention (`feat/`, `fix/`, `chore/`, `docs/`, `hotfix/`; Jira keys stay uppercase).
+    - Without herdr, project workers fall back to a headless OpenCode worktree.
+    - Worktrees and spaces are never removed automatically.
   - `list_workers` shows the board
   - `message_worker` sends a follow-up (queued, or `steer` to interject)
   - `forget_worker` stops tracking a worker
@@ -39,6 +47,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | `title`  | `"Orchestrator"`         | Title for the orchestrator session                   |
 | `notify` | `true`                   | Queue a note when a worker is done, failed, or blocked |
 | `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
+| `herdr`  | `$HERDR_BIN_PATH` or `~/.local/bin/herdr` | Herdr binary used to open worker spaces; `false` keeps workers headless |
 
 ## Sending captures
 

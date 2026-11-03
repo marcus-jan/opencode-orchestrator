@@ -1,5 +1,7 @@
+import { homedir } from "node:os"
 import path from "node:path"
 import { Plugin } from "@opencode/plugin"
+import { branchExists, herdr, resolveBase, type Opened } from "./herdr"
 import { findProjects, gitRoot, slug } from "./projects"
 import { apply, board, EVENT_TYPES, NOTIFY_STATES, transitionFor, type Registry, type Worker } from "./registry"
 
@@ -17,6 +19,8 @@ export interface Options {
   notify: boolean
   /** Give workers spawned inside a git project their own worktree unless the call says otherwise. */
   worktree: boolean
+  /** Herdr binary used to open every worker in its own space, or false to keep workers headless. */
+  herdr: string | false
 }
 
 export function parseOptions(raw: unknown, fallbackHome: string): Options {
@@ -27,13 +31,20 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
     if (typeof value !== type) throw new Error(`${ID}: option "${key}" must be a ${type}`)
     return value as T
   }
+  const defaultHerdr = process.env.HERDR_BIN_PATH ?? path.join(homedir(), ".local", "bin", "herdr")
+  if (options.herdr !== undefined && options.herdr !== false && typeof options.herdr !== "string") {
+    throw new Error(`${ID}: option "herdr" must be a string or false`)
+  }
   return {
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
     notify: pick("notify", "boolean", true),
     worktree: pick("worktree", "boolean", true),
+    herdr: (options.herdr as string | false | undefined) ?? defaultHerdr,
   }
 }
+
+const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/GRR-8410-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder.`
 
 const str = (value: unknown, name: string, required = true) => {
   if (value === undefined && !required) return undefined
@@ -67,7 +78,8 @@ export default Plugin.define({
       const projects = await findProjects(options.home)
       const value = [
         `Git projects under ${options.home} (spawn_worker "project"): ${projects.join(", ") || "none"}`,
-        `Workers get their own worktree by default: ${options.worktree ? "yes" : "no"}`,
+        `Workers in a project get their own worktree by default: ${options.worktree ? "yes" : "no"}`,
+        NAMING,
         `Worker sessions you spawned:\n${board(registry)}`,
       ].join("\n\n")
       await ctx.session.instructions.entry
@@ -137,25 +149,29 @@ export default Plugin.define({
       editor.add({
         name: "spawn_worker",
         description:
-          "Start a new OpenCode worker session with an initial prompt, optionally in its own git worktree of a project. The worker runs independently; its status appears on your worker board.",
+          "Start a new OpenCode worker for an idea. Inside a project it gets a new branch + worktree opened as a herdr space nested under the repo; otherwise a new herdr space in the orchestrator's folder. Opens in the background; status appears on your worker board.",
         input: {
           type: "object",
           properties: {
-            title: { type: "string", description: "Short title for the worker session" },
+            title: { type: "string", description: "Short friendly name: herdr space label and session title" },
             prompt: { type: "string", description: "Full task for the worker; it has no other context" },
             project: {
               type: "string",
-              description: `Project folder under ${options.home} (see list_projects), e.g. "rate.com"`,
+              description: `Project folder under ${options.home} (see list_projects), e.g. "rate.com". Omit for ideas not tied to a repo`,
             },
             directory: {
               type: "string",
               description: "Subdirectory inside the project (or relative to the orchestrator home when no project)",
             },
-            worktree: {
-              type: ["boolean", "string"],
-              description: `Give the worker its own git worktree: true (named from the title) or a name. Default ${options.worktree}`,
+            branch: {
+              type: "string",
+              description: "New branch name following the repo convention, e.g. feat/GRR-8410-short-description",
             },
-            base: { type: "string", description: "Starting ref for the worktree (default: the project's current HEAD)" },
+            base: { type: "string", description: "Ref to branch from (default develop, or master for hotfix/ branches)" },
+            worktree: {
+              type: "boolean",
+              description: `Give a project worker its own branch + worktree (default ${options.worktree}); false works in the checkout`,
+            },
             agent: { type: "string", description: "Agent to run (default: the configured default agent)" },
           },
           required: ["title", "prompt"],
@@ -168,48 +184,82 @@ export default Plugin.define({
           const prompt = str(input.prompt, "prompt")!
           const project = str(input.project, "project", false)
           const agent = str(input.agent, "agent", false)
-          const base = str(input.base, "base", false)
           const anchor = project ? path.resolve(options.home, project) : options.home
           const target = path.resolve(anchor, str(input.directory, "directory", false) ?? ".")
           const root = await gitRoot(target)
           if (project && !root) throw new Error(`"${project}" is not a git project under ${options.home}`)
 
-          // The configured default only applies inside a git project; an explicit request must have one.
-          const wanted = input.worktree === undefined ? options.worktree && !!root : input.worktree
-          if (typeof wanted !== "boolean" && typeof wanted !== "string") throw new Error(`"worktree" must be a boolean or string`)
-          const worktreeName = wanted === false ? undefined : slug(wanted === true ? title : wanted)
-          if (worktreeName && !root) throw new Error(`a worktree needs a git project; ${target} is not inside one`)
+          if (input.worktree !== undefined && typeof input.worktree !== "boolean") throw new Error(`"worktree" must be a boolean`)
+          const wantTree = (input.worktree as boolean | undefined) ?? (options.worktree && !!root)
+          if (wantTree && !root) throw new Error(`a worktree needs a git project; ${target} is not inside one`)
 
-          return enqueue(async () => {
-            const session = await ctx.session.create({
-              title,
-              agent,
-              location: { directory: worktreeName ? root! : target },
-              metadata: { orchestrator: orchestratorID ?? null },
-            })
-            let directory = target
-            if (worktreeName) {
-              const created = await ctx.worktree.create({ projectID: session.projectID, name: worktreeName, branch: base })
-              directory = path.join(created.directory, path.relative(root!, target))
-              await ctx.session.move({ sessionID: session.id, directory })
-            }
+          let branch: string | undefined
+          let base: string | undefined
+          if (wantTree) {
+            branch = str(input.branch, "branch", false) ?? `feat/${slug(title)}`
+            if (await branchExists(root!, branch)) throw new Error(`branch "${branch}" already exists in ${root}`)
+            const explicit = str(input.base, "base", false)
+            const candidates = explicit ? [explicit] : branch.startsWith("hotfix/") ? ["master", "main"] : ["develop", "master", "main"]
+            base = await resolveBase(root!, candidates)
+          }
+
+          const mux = options.herdr ? herdr(options.herdr) : undefined
+          const useHerdr = !!mux && (await mux.available())
+          let space: Opened | undefined
+          let directory = target
+          if (useHerdr && branch) {
+            const parent = await mux!.repoSpace(root!).catch(() => undefined)
+            space = await mux!.worktree({ root: root!, space: parent?.workspace_id, branch, base: base!, label: title })
+            directory = path.join(space.directory, path.relative(root!, target))
+          } else if (useHerdr) {
+            space = await mux!.workspace({ cwd: target, label: title })
+          }
+
+          // Without herdr, fall back to an OpenCode-managed worktree for project workers.
+          const headlessTree = !!branch && !space
+          const session = await ctx.session.create({
+            title,
+            agent,
+            location: { directory: headlessTree ? root! : directory },
+            metadata: { orchestrator: orchestratorID ?? null },
+          })
+          if (headlessTree) {
+            const created = await ctx.worktree.create({ projectID: session.projectID, name: slug(branch!), branch: base })
+            directory = path.join(created.directory, path.relative(root!, target))
+            await ctx.session.move({ sessionID: session.id, directory })
+          }
+
+          await enqueue(async () => {
             const now = Date.now()
             registry[session.id] = {
               id: session.id,
               title,
               directory,
               project: root,
-              worktree: worktreeName,
+              worktree: branch,
+              space: space?.workspace,
               state: "queued",
               created: now,
               updated: now,
             }
             await save()
-            await ctx.session.prompt({ sessionID: session.id, text: prompt })
-            await publish()
-            const where = worktreeName ? `worktree "${worktreeName}" at ${directory}` : directory
-            return { content: `Spawned worker "${title}" as ${session.id} in ${where}.` }
           })
+
+          let warning = ""
+          if (space) {
+            await mux!
+              .startOpencode({ label: title, pane: space.pane, sessionID: session.id })
+              .catch((error: unknown) => (warning = ` Could not attach OpenCode in herdr ${space!.workspace}: ${error}`))
+          }
+          await ctx.session.prompt({ sessionID: session.id, text: prompt })
+          await enqueue(publish)
+
+          const where = [
+            branch && `branch ${branch} off ${base}`,
+            directory,
+            space ? `herdr space ${space.workspace}` : !options.herdr ? undefined : "headless (herdr unavailable)",
+          ].filter(Boolean)
+          return { content: `Spawned worker "${title}" as ${session.id}: ${where.join(", ")}.${warning}` }
         },
       })
       editor.add({

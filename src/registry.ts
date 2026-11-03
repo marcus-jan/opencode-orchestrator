@@ -8,6 +8,8 @@ export interface Worker {
   project?: string
   /** Worktree name, when the worker was given its own worktree. */
   worktree?: string
+  /** Herdr workspace ID the worker's TUI was opened in. */
+  space?: string
   state: WorkerState
   detail?: string
   created: number
@@ -86,7 +88,7 @@ export function board(registry: Registry, now = Date.now()) {
     .map((w) => {
       const age = formatAge(now - w.updated)
       const detail = w.detail ? ` (${w.detail})` : ""
-      const tree = w.worktree ? ` [worktree ${w.worktree}]` : ""
+      const tree = (w.worktree ? ` [worktree ${w.worktree}]` : "") + (w.space ? ` [herdr ${w.space}]` : "")
       return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory}${tree} — ${age} ago${detail}`
     })
     .join("\n")
