@@ -42,7 +42,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "/Volumes/Workspace/git/opencode-orchestrator", "options": { "home": "/Volumes/Workspace/git" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.0", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```

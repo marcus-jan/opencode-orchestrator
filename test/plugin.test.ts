@@ -142,7 +142,7 @@ test("lists git projects and tells the orchestrator how to name workers", async 
   expect((await tools.get("list_projects").execute({})).content).toBe("- api\n- web")
   const value = calls.find((c) => c.method === "board")?.input.value
   expect(value).toContain("api, web")
-  expect(value).toContain("feat/GRR-8410")
+  expect(value).toContain("feat/ABC-123")
   await cleanup()
 })
 
@@ -157,12 +157,12 @@ test("opens project workers as a herdr worktree space nested under the repo", as
     why: "Login redirect bug from a capture",
     project: "web",
     directory: "packages/ui",
-    branch: "fix/GRR-1-login",
+    branch: "fix/ABC-1-login",
   })
-  const worktree = path.join(home, ".herdr", "web", "fix-GRR-1-login", "packages", "ui")
-  expect(result.content).toBe(`Spawned worker "Fix Login" as ses_2: branch fix/GRR-1-login off origin/develop, ${worktree}, herdr space w10.`)
+  const worktree = path.join(home, ".herdr", "web", "fix-ABC-1-login", "packages", "ui")
+  expect(result.content).toBe(`Spawned worker "Fix Login" as ses_2: branch fix/ABC-1-login off origin/develop, ${worktree}, herdr space w10.`)
   expect(runs).toContainEqual([
-    "herdr", "worktree", "create", "--workspace", "w1", "--branch", "fix/GRR-1-login",
+    "herdr", "worktree", "create", "--workspace", "w1", "--branch", "fix/ABC-1-login",
     "--base", "origin/develop", "--label", "Fix Login", "--no-focus",
   ])
   expect(runs).toContainEqual([
@@ -174,7 +174,7 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   expect(calls.find((c) => c.method === "prompt")?.input).toEqual({ sessionID: "ses_2", text: "do it" })
   const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_2")?.input.value
   expect(pinned).toContain(`Project: ${path.join(home, "web")}`)
-  expect(pinned).toContain("Branch: fix/GRR-1-login off origin/develop")
+  expect(pinned).toContain("Branch: fix/ABC-1-login off origin/develop")
   expect(pinned).toContain("Herdr space: w10")
   expect(calls.findIndex((c) => c.input?.key === "orchestrator-origin")).toBeLessThan(calls.findIndex((c) => c.method === "prompt"))
 
@@ -188,7 +188,7 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   expect(notes[0].input.sessionID).toBe("ses_1")
   expect(notes[0].input.text).toContain("is now done")
   expect((await tools.get("list_workers").execute({})).content).toContain(
-    `[done] Fix Login — ses_2 — ${worktree} [worktree fix/GRR-1-login] [herdr w10]`,
+    `[done] Fix Login — ses_2 — ${worktree} [worktree fix/ABC-1-login] [herdr w10]`,
   )
   await cleanup()
 })

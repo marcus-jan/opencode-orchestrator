@@ -51,7 +51,7 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
   }
 }
 
-const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/GRR-8410-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder. Always pass "why": the source of the request and the outcome the user wants.`
+const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/ABC-123-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder. Always pass "why": the source of the request and the outcome the user wants.`
 
 export interface Origin {
   orchestrator?: string
@@ -190,7 +190,7 @@ export default Plugin.define({
             prompt: { type: "string", description: "Full task for the worker; it has no other context" },
             project: {
               type: "string",
-              description: `Project folder under ${options.home} (see list_projects), e.g. "rate.com". Omit for ideas not tied to a repo`,
+              description: `Project folder under ${options.home} (see list_projects), e.g. "my-app". Omit for ideas not tied to a repo`,
             },
             directory: {
               type: "string",
@@ -198,7 +198,7 @@ export default Plugin.define({
             },
             branch: {
               type: "string",
-              description: "New branch name following the repo convention, e.g. feat/GRR-8410-short-description",
+              description: "New branch name following the repo convention, e.g. feat/ABC-123-short-description",
             },
             base: { type: "string", description: "Ref to branch from (default develop, or master for hotfix/ branches)" },
             worktree: {
