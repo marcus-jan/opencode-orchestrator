@@ -141,6 +141,7 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   const result = await tools.get("spawn_worker").execute({
     title: "Fix Login",
     prompt: "do it",
+    why: "Login redirect bug from a capture",
     project: "web",
     directory: "packages/ui",
     branch: "fix/GRR-1-login",
@@ -157,6 +158,11 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   expect(created(calls)[0].input.location).toEqual({ directory: worktree })
   expect(calls.some((c) => c.method === "worktree" || c.method === "move")).toBe(false)
   expect(calls.find((c) => c.method === "prompt")?.input).toEqual({ sessionID: "ses_2", text: "do it" })
+  const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_2")?.input.value
+  expect(pinned).toContain(`Project: ${path.join(home, "web")}`)
+  expect(pinned).toContain("Branch: fix/GRR-1-login off origin/develop")
+  expect(pinned).toContain("Herdr space: w10")
+  expect(calls.findIndex((c) => c.input?.key === "orchestrator-origin")).toBeLessThan(calls.findIndex((c) => c.method === "prompt"))
 
   emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
   emit({ type: "session.execution.succeeded", data: { sessionID: "ses_2" } })
@@ -179,9 +185,9 @@ test("picks branch and base defaults: develop, master for hotfixes, main as a fa
   const spawn = tools.get("spawn_worker")
   const bases = () => runs.filter((r) => r[1] === "worktree").map((r) => [r.at(-6), r.at(-4)])
 
-  await spawn.execute({ title: "New Thing", prompt: "p", project: "web" })
-  await spawn.execute({ title: "Urgent", prompt: "p", project: "web", branch: "hotfix/prod-down" })
-  await spawn.execute({ title: "Api", prompt: "p", project: "api", branch: "chore/x" })
+  await spawn.execute({ title: "New Thing", prompt: "p", why: "w", project: "web" })
+  await spawn.execute({ title: "Urgent", prompt: "p", why: "w", project: "web", branch: "hotfix/prod-down" })
+  await spawn.execute({ title: "Api", prompt: "p", why: "w", project: "api", branch: "chore/x" })
   expect(bases()).toEqual([
     ["feat/new-thing", "origin/develop"],
     ["hotfix/prod-down", "origin/master"],
@@ -190,23 +196,32 @@ test("picks branch and base defaults: develop, master for hotfixes, main as a fa
   // No main space for api, so herdr places it by cwd.
   expect(runs.find((r) => r.includes("chore/x"))).toContain("--cwd")
 
-  await expect(spawn.execute({ title: "t", prompt: "p", project: "web", branch: "feat/taken" })).rejects.toThrow("already exists")
-  await expect(spawn.execute({ title: "t", prompt: "p", project: "web", base: "nope" })).rejects.toThrow("none of nope exist")
+  await expect(spawn.execute({ title: "t", prompt: "p", why: "w", project: "web", branch: "feat/taken" })).rejects.toThrow("already exists")
+  await expect(spawn.execute({ title: "t", prompt: "p", why: "w", project: "web", base: "nope" })).rejects.toThrow("none of nope exist")
   await cleanup()
 })
 
 test("ideas outside a repo get a new herdr space in the orchestrator's folder", async () => {
   const runs = fakeShell()
   const { tools, calls, cleanup } = await started()
-  const result = await tools.get("spawn_worker").execute({ title: "Research idea", prompt: "think" })
+  const result = await tools.get("spawn_worker").execute({
+    title: "Research idea",
+    prompt: "think",
+    why: "From a Scrawl capture; user wants options",
+  })
   expect(runs).toContainEqual(["herdr", "workspace", "create", "--cwd", home, "--label", "Research idea", "--no-focus"])
+  const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_2")?.input
+  expect(pinned.key).toBe("orchestrator-origin")
+  expect(pinned.value).toContain("started by the OpenCode orchestrator (ses_1)")
+  expect(pinned.value).toContain("Why: From a Scrawl capture; user wants options")
+  expect(pinned.value).toContain("Not tied to a repo")
   expect(created(calls)[0].input.location).toEqual({ directory: home })
   expect(result.content).toContain("herdr space w10")
   expect(runs.some((r) => r[0] === "git")).toBe(false)
 
-  await expect(tools.get("spawn_worker").execute({ title: "x", prompt: "y", project: "notes" })).rejects.toThrow("not a git project")
+  await expect(tools.get("spawn_worker").execute({ title: "x", prompt: "y", why: "w", project: "notes" })).rejects.toThrow("not a git project")
   await expect(
-    tools.get("spawn_worker").execute({ title: "x", prompt: "y", directory: "notes", worktree: true }),
+    tools.get("spawn_worker").execute({ title: "x", prompt: "y", why: "w", directory: "notes", worktree: true }),
   ).rejects.toThrow("a worktree needs a git project")
   await cleanup()
 })
@@ -214,7 +229,7 @@ test("ideas outside a repo get a new herdr space in the orchestrator's folder", 
 test("falls back to headless OpenCode worktrees when herdr is unavailable", async () => {
   fakeShell({ herdr: false })
   const { tools, calls, cleanup } = await started()
-  const result = await tools.get("spawn_worker").execute({ title: "Fix", prompt: "p", project: "web", branch: "fix/a" })
+  const result = await tools.get("spawn_worker").execute({ title: "Fix", prompt: "p", why: "w", project: "web", branch: "fix/a" })
   expect(created(calls)[0].input.location).toEqual({ directory: path.join(home, "web") })
   expect(calls.find((c) => c.method === "worktree")?.input).toEqual({ projectID: "prj_1", name: "fix-a", branch: "origin/develop" })
   expect(calls.find((c) => c.method === "move")?.input.directory).toBe(path.join(home, ".worktrees", "fix-a"))

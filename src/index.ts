@@ -9,6 +9,7 @@ const ID = "orchestrator"
 const ORCHESTRATOR_KEY = "orchestrator"
 const WORKERS_KEY = "workers"
 const BOARD_KEY = "orchestrator-workers"
+const ORIGIN_KEY = "orchestrator-origin"
 
 export interface Options {
   /** Directory the orchestrator lives in. Only the plugin instance for this location is active. */
@@ -44,7 +45,33 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
   }
 }
 
-const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/GRR-8410-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder.`
+const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/GRR-8410-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder. Always pass "why": the source of the request and the outcome the user wants.`
+
+export interface Origin {
+  orchestrator?: string
+  why: string
+  project?: string
+  branch?: string
+  base?: string
+  directory: string
+  space?: string
+  spawned: string
+}
+
+/** Standing context pinned into a worker so it knows why it exists after its first prompt is compacted away. */
+export function origin(o: Origin): string {
+  return [
+    `You are a worker session started by the OpenCode orchestrator${o.orchestrator ? ` (${o.orchestrator})` : ""} on ${o.spawned}.`,
+    `Why: ${o.why}`,
+    o.project ? `Project: ${o.project}` : "Not tied to a repo: this is an idea space. Do not edit sibling repos; recommend a repo worker when code work is needed.",
+    o.branch && `Branch: ${o.branch} off ${o.base}`,
+    `Working directory: ${o.directory}`,
+    o.space && `Herdr space: ${o.space}`,
+    "The orchestrator only tracks your status (running, blocked, done, failed). Finish by summarizing what you did and what is left.",
+  ]
+    .filter(Boolean)
+    .join("\n")
+}
 
 const str = (value: unknown, name: string, required = true) => {
   if (value === undefined && !required) return undefined
@@ -172,9 +199,14 @@ export default Plugin.define({
               type: "boolean",
               description: `Give a project worker its own branch + worktree (default ${options.worktree}); false works in the checkout`,
             },
+            why: {
+              type: "string",
+              description:
+                "One or two sentences on why this worker exists: the source (e.g. Scrawl capture, dictation) and what the user wants out of it. Pinned in the worker's context",
+            },
             agent: { type: "string", description: "Agent to run (default: the configured default agent)" },
           },
-          required: ["title", "prompt"],
+          required: ["title", "prompt", "why"],
           additionalProperties: false,
         },
         options: { namespace: ID },
@@ -182,6 +214,7 @@ export default Plugin.define({
           const input = raw as Record<string, unknown>
           const title = str(input.title, "title")!
           const prompt = str(input.prompt, "prompt")!
+          const why = str(input.why, "why")!
           const project = str(input.project, "project", false)
           const agent = str(input.agent, "agent", false)
           const anchor = project ? path.resolve(options.home, project) : options.home
@@ -238,11 +271,27 @@ export default Plugin.define({
               project: root,
               worktree: branch,
               space: space?.workspace,
+              why,
               state: "queued",
               created: now,
               updated: now,
             }
             await save()
+          })
+
+          await ctx.session.instructions.entry.put({
+            sessionID: session.id,
+            key: ORIGIN_KEY,
+            value: origin({
+              orchestrator: orchestratorID,
+              why,
+              project: root,
+              branch,
+              base,
+              directory,
+              space: space?.workspace,
+              spawned: new Date().toISOString(),
+            }),
           })
 
           let warning = ""

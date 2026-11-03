@@ -10,6 +10,8 @@ export interface Worker {
   worktree?: string
   /** Herdr workspace ID the worker's TUI was opened in. */
   space?: string
+  /** Why the orchestrator started this worker. */
+  why?: string
   state: WorkerState
   detail?: string
   created: number

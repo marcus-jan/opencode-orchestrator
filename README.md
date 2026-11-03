@@ -20,6 +20,12 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
       convention (`feat/`, `fix/`, `chore/`, `docs/`, `hotfix/`; Jira keys stay uppercase).
     - Without herdr, project workers fall back to a headless OpenCode worktree.
     - Worktrees and spaces are never removed automatically.
+    - `why` (required) is a sentence or two on where the request came from and what the user wants. It
+      is pinned into the worker as a standing context entry (`orchestrator-origin`) together with the
+      orchestrator session, project, branch, base, directory and herdr space, so the worker still knows
+      why it exists after its first prompt is compacted away.
+- An `AGENTS.md` in `home` gives the orchestrator and non-repo idea spaces a map of the repos. Sessions
+  inside a repo or a herdr worktree don't load it (OpenCode stops at the project root).
   - `list_workers` shows the board
   - `message_worker` sends a follow-up (queued, or `steer` to interject)
   - `forget_worker` stops tracking a worker
