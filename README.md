@@ -42,7 +42,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.0", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.1", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```
@@ -54,7 +54,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | `notify` | `true`                   | Queue a note when a worker is done, failed, or blocked |
 | `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
 | `herdr`  | `$HERDR_BIN_PATH` or `~/.local/bin/herdr` | Herdr binary used to open worker spaces; `false` keeps workers headless |
-| `model`  | the spawning session's model | Worker model as `providerID/modelID`. Workers never fall back to OpenCode's free models unless you pick one |
+| `model`  | the spawning session's model | Worker model as `providerID/modelID`. If it isn't available, workers use the spawning session's model (noted in the spawn result); with neither, the spawn fails instead of using OpenCode's free models |
 
 ## Sending captures
 

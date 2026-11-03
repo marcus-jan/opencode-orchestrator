@@ -17,11 +17,13 @@ mkdirSync(path.join(home, ".git", "gk"), { recursive: true })
 afterAll(() => rmSync(home, { recursive: true, force: true }))
 
 const realExec = runtime.exec
-afterEach(() => void (runtime.exec = realExec))
+const realSleep = runtime.sleep
+afterEach(() => void Object.assign(runtime, { exec: realExec, sleep: realSleep }))
 
 /** Fake git + herdr. `web` has develop/master; `api` only main; branch feat/taken exists. */
-function fakeShell({ herdr = true } = {}) {
+function fakeShell({ herdr = true, busy = 0 } = {}) {
   const runs: string[][] = []
+  runtime.sleep = async () => {}
   const refs: Record<string, string[]> = { web: ["origin/develop", "origin/master"], api: ["main"] }
   let next = 9
   runtime.exec = async (file, args) => {
@@ -49,6 +51,9 @@ function fakeShell({ herdr = true } = {}) {
       return opened(dir, { worktree: { path: dir } })
     }
     if (args[0] === "workspace" && args[1] === "create") return opened(flag("--cwd"))
+    if (args[0] === "agent" && busy-- > 0) {
+      throw new Error(`herdr agent start: {"error":{"code":"agent_pane_busy","message":"not an available shell"}}`)
+    }
     return json({})
   }
   return runs
@@ -80,6 +85,9 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       prompt: record("prompt"),
       synthetic: record("synthetic"),
       instructions: { entry: { put: record("board") } },
+    },
+    model: {
+      list: async () => ({ data: [{ id: "opus", modelID: "opus", providerID: "anthropic" }] }),
     },
     worktree: {
       create: record("worktree", (input) => ({ directory: path.join(home, ".worktrees", input.name) })),
@@ -238,6 +246,33 @@ test("ideas outside a repo get a new herdr space in the orchestrator's folder", 
     tools.get("spawn_worker").execute({ title: "x", prompt: "y", why: "w", directory: "notes", worktree: true }),
   ).rejects.toThrow("a worktree needs a git project")
   await cleanup()
+})
+
+test("retries herdr agent start while a new pane's shell is still busy", async () => {
+  const runs = fakeShell({ busy: 2 })
+  const { tools, cleanup } = await started()
+  const result = await tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
+  expect(runs.filter((r) => r[1] === "agent")).toHaveLength(3)
+  expect(result.content).not.toContain("Could not attach")
+  await cleanup()
+})
+
+test("falls back to an available model and refuses to spawn without one", async () => {
+  const runs = fakeShell()
+  const fallback = await started({ model: "gone/old-model" })
+  const result = await fallback.tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
+  expect(created(fallback.calls)[0].input.model).toEqual({ id: "opus", providerID: "anthropic" })
+  expect(result.content).toContain("Model gone/old-model is unavailable; using anthropic/opus.")
+  await fallback.cleanup()
+
+  const broken = await started({ model: "gone/old-model" })
+  broken.ctx.session.get = async () => ({ model: { id: "also-gone", providerID: "gone" } }) as never
+  const before = runs.length
+  await expect(broken.tools.get("spawn_worker").execute({ title: "Idea 2", prompt: "p", why: "w" })).rejects.toThrow(
+    "no worker model available (tried gone/old-model, gone/also-gone)",
+  )
+  expect(runs.slice(before).some((r) => r[1] === "workspace" && r[2] === "create")).toBe(false)
+  await broken.cleanup()
 })
 
 test("falls back to headless OpenCode worktrees when herdr is unavailable", async () => {

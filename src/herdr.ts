@@ -9,8 +9,8 @@ export const exec: Exec = (file, args) =>
     ),
   )
 
-/** Swappable process runner (tests replace `runtime.exec`). */
-export const runtime = { exec }
+/** Swappable process runner and clock (tests replace them). */
+export const runtime = { exec, sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }
 const run: Exec = (file, args) => runtime.exec(file, args)
 
 export interface Space {
@@ -67,21 +67,18 @@ export function herdr(bin: string) {
       ),
     workspace: async (input: { cwd: string; label: string }) =>
       opened(await call(["workspace", "create", "--cwd", input.cwd, "--label", input.label, "--no-focus"])),
-    startOpencode: (input: { label: string; pane: string; sessionID: string }) =>
-      call([
-        "agent",
-        "start",
-        agentName(input.label),
-        "--kind",
-        "opencode",
-        "--pane",
-        input.pane,
-        "--timeout",
-        "90000",
-        "--",
-        "--session",
-        input.sessionID,
-      ]),
+    /** A freshly created pane needs a moment before its shell accepts an agent, so retry while it is busy. */
+    startOpencode: async (input: { label: string; pane: string; sessionID: string }, attempts = 15) => {
+      const args = ["agent", "start", agentName(input.label), "--kind", "opencode", "--pane", input.pane]
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await call([...args, "--timeout", "90000", "--", "--session", input.sessionID])
+        } catch (error) {
+          if (attempt >= attempts || !String(error).includes("agent_pane_busy")) throw error
+          await runtime.sleep(1000)
+        }
+      }
+    },
   }
 }
 

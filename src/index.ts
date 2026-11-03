@@ -151,6 +151,29 @@ export default Plugin.define({
       return created.id
     }
 
+    /**
+     * Workers without a model fall back to OpenCode's free models, and a stale configured model fails
+     * every turn, so use the first of (option, spawning session's model) that is actually available.
+     */
+    const workerModel = async (callerID: string, directory: string) => {
+      const caller = (await ctx.session.get({ sessionID: callerID }).catch(() => undefined))?.model
+      const candidates = [options.model, caller].filter((ref): ref is NonNullable<typeof ref> => !!ref)
+      const name = (ref: { providerID: string; id: string }) => `${ref.providerID}/${ref.id}`
+      if (!candidates.length) {
+        throw new Error(`no worker model: set the "model" option or give the orchestrator session a model`)
+      }
+      const available = await ctx.model.list({ location: { directory } }).catch(() => undefined)
+      if (!available) return { model: candidates[0], note: "" }
+      const exists = (ref: { providerID: string; id: string }) =>
+        available.data.some((info) => info.providerID === ref.providerID && (info.modelID ?? info.id) === ref.id)
+      const model = candidates.find(exists)
+      if (!model) {
+        throw new Error(`no worker model available (tried ${candidates.map(name).join(", ")}); fix the "model" option`)
+      }
+      const note = model === candidates[0] ? "" : ` Model ${name(candidates[0])} is unavailable; using ${name(model)}.`
+      return { model, note }
+    }
+
     await ctx.command.transform((editor) => {
       editor.add({
         name: "orchestrator",
@@ -242,6 +265,8 @@ export default Plugin.define({
             base = await resolveBase(root!, candidates)
           }
 
+          // Checked before opening any space so a bad model doesn't leave an empty worktree behind.
+          const { model, note } = await workerModel(context.sessionID, target)
           const mux = options.herdr ? herdr(options.herdr) : undefined
           const useHerdr = !!mux && (await mux.available())
           let space: Opened | undefined
@@ -256,8 +281,6 @@ export default Plugin.define({
 
           // Without herdr, fall back to an OpenCode-managed worktree for project workers.
           const headlessTree = !!branch && !space
-          // Without an explicit model a worker falls back to OpenCode's free models, so inherit the caller's.
-          const model = options.model ?? (await ctx.session.get({ sessionID: context.sessionID }).catch(() => undefined))?.model
           const session = await ctx.session.create({
             title,
             agent,
@@ -317,7 +340,7 @@ export default Plugin.define({
             directory,
             space ? `herdr space ${space.workspace}` : !options.herdr ? undefined : "headless (herdr unavailable)",
           ].filter(Boolean)
-          return { content: `Spawned worker "${title}" as ${session.id}: ${where.join(", ")}.${warning}` }
+          return { content: `Spawned worker "${title}" as ${session.id}: ${where.join(", ")}.${note}${warning}` }
         },
       })
       editor.add({
