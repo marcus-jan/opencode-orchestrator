@@ -2,7 +2,17 @@ import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { Plugin } from "@opencode/plugin"
-import { branchExists, branchOnOrigin, deleteBranch, herdr, removeGitWorktree, resolveBase, type Opened } from "./herdr"
+import {
+  branchExists,
+  branchOnOrigin,
+  checkoutInfo,
+  deleteBranch,
+  herdr,
+  paneSession,
+  removeGitWorktree,
+  resolveBase,
+  type Opened,
+} from "./herdr"
 import { findProjects, gitRoot, slug } from "./projects"
 import {
   apply,
@@ -17,7 +27,9 @@ import {
   type Presence,
   type Registry,
   type Worker,
+  type WorkerState,
 } from "./registry"
+import { Orchestrator, type Snapshot } from "./rpc"
 
 const ID = "orchestrator"
 const ORCHESTRATOR_KEY = "orchestrator"
@@ -84,15 +96,20 @@ export interface Origin {
   directory: string
   space?: string
   spawned: string
+  /** The session existed before and was attached to the orchestrator later. */
+  attached?: boolean
 }
 
 /** Standing context pinned into a worker so it knows why it exists after its first prompt is compacted away. */
 export function origin(o: Origin): string {
+  const by = `the OpenCode orchestrator${o.orchestrator ? ` (${o.orchestrator})` : ""}`
   return [
-    `You are a worker session started by the OpenCode orchestrator${o.orchestrator ? ` (${o.orchestrator})` : ""} on ${o.spawned}.`,
+    o.attached
+      ? `This session was attached to ${by} on ${o.spawned}; it now tracks you as a worker.`
+      : `You are a worker session started by ${by} on ${o.spawned}.`,
     `Why: ${o.why}`,
-    o.project ? `Project: ${o.project}` : "Not tied to a repo: this is an idea space. Do not edit sibling repos; recommend a repo worker when code work is needed.",
-    o.branch && `Branch: ${o.branch} off ${o.base}`,
+    o.project ? `Project: ${o.project}` : o.attached ? undefined : "Not tied to a repo: this is an idea space. Do not edit sibling repos; recommend a repo worker when code work is needed.",
+    o.branch && `Branch: ${o.branch}${o.base ? ` off ${o.base}` : ""}`,
     `Working directory: ${o.directory}`,
     o.space && `Herdr space: ${o.space}`,
     "The orchestrator only tracks your status (running, blocked, done, failed). Finish by summarizing what you did and what is left.",
@@ -107,13 +124,38 @@ const str = (value: unknown, name: string, required = true) => {
   return value.trim()
 }
 
+/** Session metadata key /join-orchestrator sets; the home instance sees it through the global event stream. */
+export const JOIN_KEY = "orchestratorJoin"
+
+const JOIN_COMMAND = {
+  name: "join-orchestrator",
+  description: "Ask the orchestrator to track this session as a worker (optional: why)",
+}
+
+/** Works from any location: it only flags the session, so it doesn't need the home instance's state. */
+const requestJoin = (ctx: Plugin.Context) => async ({ sessionID, prompt }: { sessionID: string; prompt?: { text?: string } }) => {
+  const info = await ctx.session.get({ sessionID })
+  const why = prompt?.text?.trim() || null
+  await ctx.session.update({ sessionID, metadata: { ...(info.metadata ?? {}), [JOIN_KEY]: { why, at: Date.now() } } })
+  await ctx.session.synthetic({
+    sessionID,
+    text: "Asked the orchestrator to track this session. It will appear on its worker board and sidebar.",
+    resume: false,
+  })
+}
+
 export default Plugin.define({
   id: ID,
   async setup(ctx) {
     const options = parseOptions(ctx.options, ctx.location.directory)
     // The server creates one plugin instance per location and events are global,
     // so only the instance for the orchestrator's home does any work.
-    if (path.resolve(ctx.location.directory) !== options.home) return
+    if (path.resolve(ctx.location.directory) !== options.home) {
+      // Answer the sidebar with an empty board so TUIs on other sessions don't log errors.
+      const idle = await ctx.rpc.register(Orchestrator, { snapshot: async () => ({ workers: [] }) })
+      await ctx.command.transform((editor) => editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) }))
+      return () => void idle.dispose()
+    }
 
     const controller = new AbortController()
     let registry = ((await ctx.storage.get(WORKERS_KEY)) ?? {}) as unknown as Registry
@@ -128,7 +170,29 @@ export default Plugin.define({
 
     const save = () => ctx.storage.set(WORKERS_KEY, registry as never)
 
+    // Feeds the TUI sidebar shown in the orchestrator session.
+    const rpc = await ctx.rpc.register(Orchestrator, {
+      // RPC output must be plain JSON, so drop undefined fields.
+      snapshot: async () =>
+        JSON.parse(
+          JSON.stringify({
+            orchestrator: orchestratorID,
+            workers: Object.values(registry).map(({ id, title, state, detail, space, updated }) => ({
+              id,
+              title,
+              state,
+              detail,
+              space,
+              updated,
+            })),
+          } satisfies Snapshot),
+        ),
+    })
+    const changed = () =>
+      rpc.events.emit("changed", {}).catch((error: unknown) => console.warn(`[${ID}]`, "failed to emit change", error))
+
     const publish = async () => {
+      void changed()
       if (!orchestratorID) return
       const projects = await findProjects(options.home)
       const value = [
@@ -298,7 +362,121 @@ export default Plugin.define({
       return { model, note }
     }
 
+    /**
+     * Tracks a session that was started outside the orchestrator. Repo, branch and worktree come from its
+     * folder and the herdr space from the pane running it; nothing new is created.
+     */
+    const adopt = async (sessionID: string, why: string | undefined) => {
+      if (sessionID === orchestratorID) throw new Error("that is the orchestrator session itself")
+      const info = await ctx.session.get({ sessionID }).catch((error: unknown) => {
+        throw notFound(error) ? new Error(`session ${sessionID} does not exist`) : error
+      })
+      if (info.parentID) throw new Error(`${sessionID} is a subagent session; attach its parent ${info.parentID} instead`)
+      const current = registry[sessionID]
+      if (current && !isClosed(current)) return `"${current.title}" (${sessionID}) is already tracked.`
+
+      const directory = info.location.directory
+      const git = await checkoutInfo(directory)
+      const linked = git?.linked && git.branch ? git : undefined
+      const panes = mux && (await mux.available()) ? await mux.panes().catch(() => []) : []
+      // A session in a repo's main checkout shares the repo's own space; close_worker must never close that.
+      const found = panes.find((pane) => paneSession(pane) === sessionID)?.workspace_id
+      const space = linked || !git ? found : undefined
+      const time = info.time as { busy?: number; idle?: number }
+      const state: WorkerState =
+        time.busy && (!time.idle || time.busy > time.idle) ? "running" : info.outcome === "failed" ? "failed" : "done"
+      const title = info.title || sessionID
+      const reason = why ?? `Attached by the user; continue what "${title}" was doing.`
+
+      await enqueue(async () => {
+        const now = Date.now()
+        registry[sessionID] = {
+          id: sessionID,
+          title,
+          directory,
+          project: git?.root,
+          worktree: linked?.branch,
+          checkout: linked?.checkout,
+          space,
+          why: reason,
+          attached: true,
+          state,
+          created: now,
+          updated: now,
+        }
+        await save()
+        await publish()
+      })
+      await ctx.session.instructions.entry.put({
+        sessionID,
+        key: ORIGIN_KEY,
+        value: origin({
+          orchestrator: orchestratorID,
+          why: reason,
+          project: git?.root,
+          branch: git?.branch,
+          directory,
+          space,
+          spawned: new Date().toISOString(),
+          attached: true,
+        }),
+      })
+      const where = [git?.branch && `branch ${git.branch}${linked ? " (worktree)" : ""}`, directory, space && `herdr space ${space}`]
+      return `Attached "${title}" (${sessionID}) as ${state}: ${where.filter(Boolean).join(", ")}.`
+    }
+
+    /**
+     * Finds sessions matching what the user said: a session id, a herdr space id or label, or words from
+     * the session title. Root sessions only, newest first, never the orchestrator.
+     */
+    const findSessions = async (query: string) => {
+      const q = query.trim()
+      if (/^ses_\w+$/.test(q)) return [q]
+      const found = new Set<string>()
+      if (mux && (await mux.available())) {
+        const spaces = await mux.list().catch(() => [])
+        const lower = q.toLowerCase()
+        const hits = spaces.filter((s) => s.workspace_id.toLowerCase() === lower || s.label.toLowerCase().includes(lower))
+        for (const space of hits) {
+          for (const pane of await mux.panes(space.workspace_id).catch(() => [])) {
+            const id = paneSession(pane)
+            if (id) found.add(id)
+          }
+        }
+      }
+      const listed = await ctx.session.list({ search: q, parentID: null, order: "desc", limit: 10 }).catch(() => undefined)
+      for (const session of listed?.data ?? []) if (!session.parentID) found.add(session.id)
+      found.delete(orchestratorID ?? "")
+      return [...found]
+    }
+
+    const attach = async (query: string, why: string | undefined) => {
+      const matches = await findSessions(query)
+      if (matches.length === 1) return adopt(matches[0], why)
+      if (!matches.length) return `No session matches "${query}". Try its session id, herdr space (e.g. w4K) or title words.`
+      const lines = await Promise.all(
+        matches.map(async (id) => {
+          const info = await ctx.session.get({ sessionID: id }).catch(() => undefined)
+          return `- ${id} — ${info?.title ?? "?"} — ${info?.location.directory ?? "?"}${registry[id] && !isClosed(registry[id]) ? " (already tracked)" : ""}`
+        }),
+      )
+      return `Several sessions match "${query}"; ask the user which one, then call attach_worker with its session id:\n${lines.join("\n")}`
+    }
+
     await ctx.command.transform((editor) => {
+      editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) })
+      editor.add({
+        name: "attach",
+        description: "Track an existing session as a worker: session id, herdr space (w4K) or title words",
+        execute: ({ sessionID, prompt }) =>
+          (async () => {
+            const query = prompt?.text?.trim()
+            const text = query
+              ? await attach(query, undefined).catch((error: unknown) => `Could not attach "${query}": ${String(error).replace(/^Error: /, "")}`)
+              : "Usage: /attach <session id | herdr space id or label | title words>"
+            await ctx.session.synthetic({ sessionID, text, description: "Attach worker", resume: false })
+          })(),
+      })
       editor.add({
         name: "orchestrator",
         description: "Pin this session as the orchestrator (send Scrawl/Hex here)",
@@ -596,6 +774,28 @@ export default Plugin.define({
         },
       })
       editor.add({
+        name: "attach_worker",
+        description:
+          "Start tracking a session the orchestrator did not spawn (status, alerts, close detection, sidebar). Only when the user asks. If several sessions match, ask the user which one.",
+        input: {
+          type: "object",
+          properties: {
+            session: {
+              type: "string",
+              description: "Session id, herdr space id or label (e.g. w4K), or words from the session title",
+            },
+            why: { type: "string", description: "What the user wants from this session, if they said. Pinned in its context" },
+          },
+          required: ["session"],
+          additionalProperties: false,
+        },
+        options: { namespace: ID },
+        execute: async (raw) => {
+          const input = raw as Record<string, unknown>
+          return { content: await attach(str(input.session, "session")!, str(input.why, "why", false)) }
+        },
+      })
+      editor.add({
         name: "forget_worker",
         description: "Stop tracking a worker (does not delete its session).",
         input: {
@@ -619,7 +819,22 @@ export default Plugin.define({
 
     void (async () => {
       try {
-        for await (const event of ctx.event.subscribe({ types: [...EVENT_TYPES], signal: controller.signal })) {
+        const types = [...EVENT_TYPES, "session.metadata.updated"] as const
+        for await (const event of ctx.event.subscribe({ types: [...types], signal: controller.signal })) {
+          if (event.type === "session.metadata.updated") {
+            const data = event.data as { sessionID?: string; metadata?: Record<string, unknown> }
+            const join = data.metadata?.[JOIN_KEY] as { why?: string | null } | null | undefined
+            if (!data.sessionID || !join || typeof join !== "object") continue
+            const sessionID = data.sessionID
+            // Clear the request first so later metadata updates don't re-attach a worker the user forgot.
+            await ctx.session
+              .update({ sessionID, metadata: { ...data.metadata, [JOIN_KEY]: null } as never })
+              .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear join request", error))
+            void adopt(sessionID, join.why ?? undefined)
+              .then((text) => tell(text, "Session joined", false))
+              .catch((error: unknown) => console.warn(`[${ID}]`, `failed to attach ${sessionID}`, error))
+            continue
+          }
           if (event.type === "session.deleted") {
             const data = event.data as { sessionID?: string }
             if (data.sessionID && data.sessionID === orchestratorID) {
@@ -655,6 +870,7 @@ export default Plugin.define({
     return () => {
       controller.abort()
       if (timer) clearInterval(timer)
+      void rpc.dispose()
     }
   },
 })

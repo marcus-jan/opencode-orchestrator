@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process"
+import path from "node:path"
 
 export type Exec = (file: string, args: string[]) => Promise<string>
 
@@ -18,6 +19,17 @@ export interface Space {
   label: string
   worktree?: { repo_root: string; checkout_path: string; is_linked_worktree: boolean }
 }
+
+export interface Pane {
+  pane_id: string
+  workspace_id: string
+  cwd?: string
+  agent_session?: { kind: string; value: string }
+}
+
+/** OpenCode session a pane runs, if herdr knows it. */
+export const paneSession = (pane: Pane) =>
+  pane.agent_session?.kind === "id" && pane.agent_session.value.startsWith("ses_") ? pane.agent_session.value : undefined
 
 export interface Opened {
   workspace: string
@@ -51,6 +63,10 @@ export function herdr(bin: string) {
         (result) => new Set<string>((result.workspaces ?? []).map((space: Space) => space.workspace_id)),
         () => undefined,
       ),
+    list: async () => ((await call(["workspace", "list"])).workspaces ?? []) as Space[],
+    /** Panes (all, or one space's) with the OpenCode session each one runs. */
+    panes: async (workspace?: string) =>
+      ((await call(["pane", "list", ...(workspace ? ["--workspace", workspace] : [])])).panes ?? []) as Pane[],
     closeSpace: (id: string) => call(["workspace", "close", id]),
     /** Removes the space's worktree checkout and closes the space. */
     removeWorktree: (space: string, force: boolean) =>
@@ -114,6 +130,22 @@ export const branchOnOrigin = (root: string, branch: string) =>
 
 export const removeGitWorktree = (root: string, checkout: string, force: boolean) =>
   run("git", ["-C", root, "worktree", "remove", ...(force ? ["--force"] : []), checkout])
+
+/**
+ * Git facts for a directory: the main repo root, the checkout it sits in, its branch, and whether the
+ * checkout is a linked worktree (only those are ever removed). Undefined outside git.
+ */
+export async function checkoutInfo(dir: string) {
+  const git = (...args: string[]) => run("git", ["-C", dir, ...args]).then((out) => out.trim())
+  try {
+    const checkout = await git("rev-parse", "--show-toplevel")
+    const root = path.dirname(await git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+    const branch = (await git("branch", "--show-current").catch(() => "")) || undefined
+    return { root, checkout, branch, linked: path.resolve(checkout) !== path.resolve(root) }
+  } catch {
+    return undefined
+  }
+}
 
 export const deleteBranch = (root: string, branch: string, force: boolean) =>
   run("git", ["-C", root, "branch", force ? "-D" : "-d", branch])

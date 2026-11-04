@@ -4,6 +4,9 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { runtime } from "../src/herdr"
 import plugin, { parseOptions } from "../src/index"
+import type { WorkerState } from "../src/registry"
+import type { Snapshot } from "../src/rpc"
+import { view } from "../src/sidebar"
 
 const home = mkdtempSync(path.join(tmpdir(), "orchestrator-"))
 mkdirSync(path.join(home, "web", ".git"), { recursive: true })
@@ -25,6 +28,11 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
   const runs: string[][] = []
   const spaces = new Map<string, string | undefined>([["w1", undefined]])
   const branches = new Set(["feat/taken"])
+  /** Directories that are git checkouts, for attaching existing sessions. */
+  const checkouts = new Map<string, { root: string; checkout: string; branch?: string }>()
+  /** herdr pane running each OpenCode session, by space id. */
+  const panes = new Map<string, string>()
+  const labels = new Map<string, string>()
   runtime.sleep = async () => {}
   const refs: Record<string, string[]> = { web: ["origin/develop", "origin/master"], api: ["main"] }
   let next = 9
@@ -33,6 +41,10 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     if (file === "git") {
       const repo = path.basename(args[1])
       const ref = args.at(-1)!
+      const checkout = checkouts.get(args[1])
+      if (args[2] === "rev-parse" && ref === "--show-toplevel") return checkout ? checkout.checkout : Promise.reject(new Error("not a git repo"))
+      if (args[2] === "rev-parse" && ref === "--git-common-dir") return checkout ? path.join(checkout.root, ".git") : Promise.reject(new Error("not a git repo"))
+      if (args[2] === "branch" && ref === "--show-current") return checkout?.branch ?? ""
       if (args[2] === "fetch") return ""
       if (ref.startsWith("refs/heads/") && branches.has(ref.slice(11))) return "ok"
       if (args[2] === "worktree" && args[3] === "remove") return void rmSync(ref, { recursive: true, force: true }), ""
@@ -50,7 +62,16 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     }
     if (args[0] === "workspace" && args[1] === "list") {
       const main = { repo_root: path.join(home, "web"), is_linked_worktree: false }
-      return json({ workspaces: [...spaces.keys()].map((id) => ({ workspace_id: id, label: id, ...(id === "w1" && { worktree: main }) })) })
+      return json({
+        workspaces: [...spaces.keys()].map((id) => ({ workspace_id: id, label: labels.get(id) ?? id, ...(id === "w1" && { worktree: main }) })),
+      })
+    }
+    if (args[0] === "pane" && args[1] === "list") {
+      const only = args.includes("--workspace") ? flag("--workspace") : undefined
+      const list = [...panes].filter(([space]) => !only || space === only)
+      return json({
+        panes: list.map(([space, session]) => ({ pane_id: `${space}:p1`, workspace_id: space, agent_session: { kind: "id", value: session } })),
+      })
     }
     if (args[0] === "workspace" && args[1] === "close") return spaces.delete(args[2]), json({})
     if (args[0] === "worktree" && args[1] === "remove") {
@@ -70,7 +91,7 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     }
     return json({})
   }
-  return Object.assign(runs, { spaces, branches })
+  return Object.assign(runs, { spaces, branches, checkouts, panes, labels })
 }
 
 function fakeContext(directory: string, options: Record<string, unknown> = {}) {
@@ -79,9 +100,13 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
   const calls: { method: string; input: any }[] = []
   const deleted = new Set<string>()
   const sessions: { id: string; parentID?: string }[] = []
+  /** Extra SessionInfo fields for sessions the orchestrator did not create. */
+  const infos = new Map<string, Record<string, unknown>>()
+  const commands = new Map<string, any>()
   let next = 0
   let push: ((event: unknown) => void) | undefined
   const queue: unknown[] = []
+  const rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {}
   const record = (method: string, result: (input: any) => unknown = () => ({})) => async (input: any) => {
     calls.push({ method, input })
     return result(input)
@@ -97,7 +122,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       create: record("create", () => ({ id: `ses_${++next}`, projectID: "prj_1" })),
       get: record("get", (input) => {
         if (deleted.has(input.sessionID)) throw { _tag: "SessionNotFoundError", message: `Session not found: ${input.sessionID}` }
-        return { id: input.sessionID, model: { id: "opus", providerID: "anthropic" } }
+        return { id: input.sessionID, model: { id: "opus", providerID: "anthropic" }, ...infos.get(input.sessionID) }
       }),
       remove: record("remove", (input) => void deleted.add(input.sessionID)),
       update: record("update"),
@@ -107,7 +132,9 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
         if (deleted.has(input.sessionID)) throw { _tag: "SessionNotFoundError", message: `Session not found: ${input.sessionID}` }
         return {}
       }),
-      list: record("list", () => ({ data: sessions.filter((s) => !deleted.has(s.id)) })),
+      list: record("list", (input) => ({
+        data: sessions.filter((s) => !deleted.has(s.id) && (!input.search || String(infos.get(s.id)?.title ?? "").includes(input.search))),
+      })),
       instructions: { entry: { put: record("board") } },
     },
     model: {
@@ -116,7 +143,15 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
     worktree: {
       create: record("worktree", (input) => ({ directory: path.join(home, ".worktrees", input.name) })),
     },
-    command: { transform: async () => {} },
+    rpc: {
+      register: async (_definition: unknown, handlers: Record<string, (input: unknown) => Promise<unknown>>) => {
+        rpcHandlers.snapshot = handlers.snapshot
+        return { events: { emit: record("changed") }, dispose: async () => {} }
+      },
+    },
+    command: {
+      transform: async (fn: (editor: any) => void) => fn({ add: (command: any) => commands.set(command.name, command) }),
+    },
     tool: {
       transform: async (fn: (editor: any) => void) =>
         fn({
@@ -136,7 +171,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       }),
     },
   }
-  return { ctx, tools, calls, store, deleted, sessions, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
+  return { ctx, tools, commands, calls, store, deleted, sessions, infos, rpcHandlers, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
@@ -163,9 +198,10 @@ test("parseOptions resolves defaults and validates types", () => {
 })
 
 test("stays inactive outside its home directory", async () => {
-  const { ctx, tools, calls } = fakeContext("/elsewhere", { home })
+  const { ctx, tools, commands, calls } = fakeContext("/elsewhere", { home })
   await plugin.setup(ctx as never)
   expect(tools.size).toBe(0)
+  expect([...commands.keys()]).toEqual(["join-orchestrator"])
   expect(calls).toEqual([])
 })
 
@@ -223,6 +259,48 @@ test("opens project workers as a herdr worktree space nested under the repo", as
     `[done] Fix Login — ses_2 — ${worktree} [worktree fix/ABC-1-login] [herdr w10]`,
   )
   await cleanup()
+})
+
+test("serves the sidebar a snapshot and signals each worker change", async () => {
+  fakeShell()
+  const { tools, calls, emit, rpcHandlers, cleanup } = await started()
+  await tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
+  const before = calls.filter((c) => c.method === "changed").length
+  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
+  await settle()
+  expect(calls.filter((c) => c.method === "changed").length).toBeGreaterThan(before)
+  const snapshot = (await rpcHandlers.snapshot({})) as Snapshot
+  expect(snapshot.orchestrator).toBe("ses_1")
+  expect(snapshot.workers).toEqual([
+    { id: "ses_2", title: "Fix Login", state: "running", space: "w10", updated: expect.any(Number) },
+  ])
+  await cleanup()
+})
+
+test("sidebar view puts workers needing attention first and counts closed ones", () => {
+  const now = 10 * 60_000
+  const worker = (id: string, state: WorkerState, updated: number, extra = {}) => ({ id, title: id, state, updated, ...extra })
+  const result = view(
+    {
+      orchestrator: "ses_1",
+      workers: [
+        worker("done", "done", 0, { space: "w1" }),
+        worker("run", "running", now),
+        worker("blocked", "blocked", 0, { detail: "permission: bash" }),
+        worker("old", "closed", 0),
+      ],
+    },
+    now,
+  )
+  expect(result.heading).toBe("Workers · 1 blocked · 1 running · 1 done")
+  expect(result.closed).toBe(1)
+  expect(result.rows.map((r) => [r.id, r.marker, r.tone])).toEqual([
+    ["blocked", "!", "warning"],
+    ["run", "●", "info"],
+    ["done", "✓", "success"],
+  ])
+  expect(result.rows[0].meta).toBe("blocked: permission: bash · 10m ago")
+  expect(result.rows[2].meta).toBe("done · w1 · 10m ago")
 })
 
 test("picks branch and base defaults: develop, master for hotfixes, main as a fallback", async () => {
@@ -407,5 +485,99 @@ test("replays alerts that could not reach a deleted orchestrator", async () => {
   expect(store.get("orchestrator")).toBe("ses_3")
   const catchUp = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_3")
   expect(catchUp?.input.text).toContain('Missed while there was no orchestrator:\n- Worker "Idea" (ses_2) is now done.')
+  await cleanup()
+})
+
+/** An existing session in a herdr worktree space the orchestrator did not open. */
+function externalWorker(shell: ReturnType<typeof fakeShell>, infos: Map<string, Record<string, unknown>>) {
+  const tree = path.join(home, ".herdr", "web", "feat-metrics")
+  mkdirSync(tree, { recursive: true })
+  shell.checkouts.set(tree, { root: path.join(home, "web"), checkout: tree, branch: "feat/metrics" })
+  shell.spaces.set("w20", tree)
+  shell.labels.set("w20", "Contentstack metrics")
+  shell.panes.set("w20", "ses_ext")
+  infos.set("ses_ext", { title: "Contentstack metrics", location: { directory: tree }, time: { created: 1, updated: 5, busy: 5, idle: 3 } })
+  return tree
+}
+
+test("attaches an existing session by its herdr space and tracks it like a spawned worker", async () => {
+  const shell = fakeShell()
+  const { tools, calls, infos, emit, cleanup } = await started()
+  const tree = externalWorker(shell, infos)
+
+  const result = await tools.get("attach_worker").execute({ session: "w20" })
+  expect(result.content).toBe(`Attached "Contentstack metrics" (ses_ext) as running: branch feat/metrics (worktree), ${tree}, herdr space w20.`)
+  const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_ext")?.input
+  expect(pinned.key).toBe("orchestrator-origin")
+  expect(pinned.value).toContain("was attached to the OpenCode orchestrator (ses_1)")
+  expect(pinned.value).toContain('Why: Attached by the user; continue what "Contentstack metrics" was doing.')
+  expect(calls.some((c) => c.method === "create" && c.input.title !== "Orchestrator")).toBe(false)
+  expect((await tools.get("attach_worker").execute({ session: "ses_ext" })).content).toContain("already tracked")
+
+  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_ext" } })
+  await settle()
+  expect(calls.find((c) => c.method === "synthetic" && c.input.text.includes("is now done"))).toBeDefined()
+  const listed = (await tools.get("list_workers").execute({})).content
+  expect(listed).toContain("[done] Contentstack metrics — ses_ext")
+  expect(listed).toContain("[herdr w20]")
+  expect(listed).toContain("[attached]")
+
+  // Closing the space by hand is detected like any other worker.
+  shell.spaces.delete("w20")
+  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Contentstack metrics")
+  await cleanup()
+})
+
+test("a session in a repo's main checkout is attached without claiming the repo's herdr space", async () => {
+  const shell = fakeShell()
+  const { tools, infos, cleanup } = await started()
+  const web = path.join(home, "web")
+  shell.checkouts.set(web, { root: web, checkout: web, branch: "develop" })
+  shell.panes.set("w1", "ses_main")
+  infos.set("ses_main", { title: "Main work", location: { directory: web }, time: { created: 1, updated: 2 } })
+  const result = await tools.get("attach_worker").execute({ session: "ses_main", why: "Keep an eye on it" })
+  expect(result.content).toBe(`Attached "Main work" (ses_main) as done: branch develop, ${web}.`)
+  expect((await tools.get("list_workers").execute({})).content).not.toContain("[herdr w1]")
+  await cleanup()
+})
+
+test("asks which session to attach when several match", async () => {
+  fakeShell()
+  const { tools, sessions, infos, cleanup } = await started()
+  for (const id of ["ses_a", "ses_b"]) {
+    sessions.push({ id })
+    infos.set(id, { title: `Docs cleanup ${id}`, location: { directory: home }, time: { created: 1, updated: 1 } })
+  }
+  const result = (await tools.get("attach_worker").execute({ session: "Docs cleanup" })).content
+  expect(result).toContain("ask the user which one")
+  expect(result).toContain(`- ses_a — Docs cleanup ses_a — ${home}`)
+  expect(result).toContain(`- ses_b — Docs cleanup ses_b — ${home}`)
+  expect((await tools.get("attach_worker").execute({ session: "nothing like it" })).content).toContain("No session matches")
+  await cleanup()
+})
+
+test("/join-orchestrator in another session flags it and the orchestrator adopts it", async () => {
+  const away = fakeContext("/elsewhere", { home })
+  await plugin.setup(away.ctx as never)
+  await away.commands.get("join-orchestrator").execute({ sessionID: "ses_ext", prompt: { text: "finish the PR" } })
+  const flagged = away.calls.find((c) => c.method === "update")?.input
+  expect(flagged.metadata.orchestratorJoin).toEqual({ why: "finish the PR", at: expect.any(Number) })
+
+  const shell = fakeShell()
+  const { tools, calls, infos, emit, cleanup } = await started()
+  externalWorker(shell, infos)
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: flagged.metadata } })
+  await settle()
+  expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_ext")?.input.metadata.orchestratorJoin).toBeNull()
+  const note = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_1" && c.input.text.startsWith("Attached"))
+  expect(note?.input.resume).toBe(false)
+  const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_ext")?.input.value
+  expect(pinned).toContain("Why: finish the PR")
+
+  // The cleared flag echoes back as another metadata update; it must not attach again.
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: { orchestratorJoin: null } } })
+  await settle()
+  expect(calls.filter((c) => c.method === "synthetic" && c.input.text.startsWith("Attached"))).toHaveLength(1)
+  expect((await tools.get("list_workers").execute({})).content).toContain("[attached]")
   await cleanup()
 })

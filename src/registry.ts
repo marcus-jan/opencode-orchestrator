@@ -18,6 +18,8 @@ export interface Worker {
   space?: string
   /** Why the orchestrator started this worker. */
   why?: string
+  /** Started outside the orchestrator and attached later. */
+  attached?: boolean
   state: WorkerState
   detail?: string
   created: number
@@ -128,7 +130,7 @@ export function board(registry: Registry, now = Date.now()) {
       const age = formatAge(now - w.updated)
       const notes = [w.detail, w.leftovers?.length && `left: ${w.leftovers.join(", ")}`].filter(Boolean)
       const detail = notes.length ? ` (${notes.join("; ")})` : ""
-      const tree = (w.worktree ? ` [worktree ${w.worktree}]` : "") + (w.space ? ` [herdr ${w.space}]` : "")
+      const tree = (w.worktree ? ` [worktree ${w.worktree}]` : "") + (w.space ? ` [herdr ${w.space}]` : "") + (w.attached ? " [attached]" : "")
       return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory}${tree} — ${age} ago${detail}`
     })
     .join("\n")
