@@ -151,8 +151,10 @@ export default Plugin.define({
     // The server creates one plugin instance per location and events are global,
     // so only the instance for the orchestrator's home does any work.
     if (path.resolve(ctx.location.directory) !== options.home) {
-      // Answer the sidebar with an empty board so TUIs on other sessions don't log errors.
-      const idle = await ctx.rpc.register(Orchestrator, { snapshot: async () => ({ workers: [] }) })
+      // Answer with an empty board that points sidebars on other sessions at the home instance.
+      const idle = await ctx.rpc.register(Orchestrator, {
+        snapshot: async () => ({ home: options.home, workers: [] }) satisfies Snapshot,
+      })
       await ctx.command.transform((editor) => editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) }))
       return () => void idle.dispose()
     }
@@ -176,13 +178,15 @@ export default Plugin.define({
       snapshot: async () =>
         JSON.parse(
           JSON.stringify({
+            home: options.home,
             orchestrator: orchestratorID,
-            workers: Object.values(registry).map(({ id, title, state, detail, space, updated }) => ({
+            workers: Object.values(registry).map(({ id, title, state, detail, space, attached, updated }) => ({
               id,
               title,
               state,
               detail,
               space,
+              attached,
               updated,
             })),
           } satisfies Snapshot),

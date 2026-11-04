@@ -33,7 +33,8 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
   - `forget_worker` stops tracking a worker
 - `/join-orchestrator [why]`, run inside any other session, asks the orchestrator to track that session. It works from any folder. The orchestrator gets a one-line note when the session is attached.
 - Attached workers get the same `orchestrator-origin` context entry, status alerts, close detection, `close_worker` cleanup and sidebar row as spawned ones. A session in a repo's main checkout is never linked to the repo's own herdr space, so `close_worker` can't close that space.
-- In the TUI, the orchestrator session's sidebar lists its open workers: a status marker, title, state, herdr space and age. Workers that need attention come first. Click a worker to open its session. Other sessions don't show the panel.
+- In the TUI, the orchestrator session's sidebar lists its open workers: a status marker, title, state, herdr space and age. Workers that need attention come first. Click a worker to open its session.
+- A worker's own sidebar shows that it belongs to the orchestrator: "Orchestrator · worker" for spawned sessions, "Orchestrator · joined" for attached ones, with its current state. Click it to open the orchestrator. Untracked or closed sessions show nothing.
 - The plugin watches server events and tracks each worker as `queued → running → done | failed | interrupted`. A worker waiting on a permission prompt or a question shows as `blocked`.
 - Every `sweepSeconds` (and on `list_workers` or a deleted session) the plugin checks each worker's herdr space, worktree and session. If you closed any of them yourself, the worker becomes `closed` with a "closed manually" note. If something is left (an open space, a worktree on disk, the branch), the orchestrator is woken to ask whether to clean it up; otherwise it only gets a one-line note.
 - The board is attached to the orchestrator as a context entry. It refreshes on every change and costs no extra turns.
@@ -49,7 +50,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.0", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.1", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```

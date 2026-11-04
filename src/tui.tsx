@@ -2,7 +2,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js"
 import { Orchestrator, type Snapshot } from "./rpc"
-import { view, type Tone } from "./sidebar"
+import { membership, view, type Tone } from "./sidebar"
 
 export default Plugin.define({
   id: "orchestrator.tui",
@@ -31,17 +31,44 @@ export default Plugin.define({
         let live = true
         onCleanup(() => (live = false))
         if (!location) return setSnapshot(undefined)
-        // Instances outside the orchestrator's home answer with an empty board.
-        rpc()
-          .snapshot({}, { location })
-          .then((result) => live && setSnapshot(result as Snapshot))
+        // Instances outside the orchestrator's home answer with an empty board and the home
+        // directory, so worker sessions ask the home instance whether they are tracked.
+        const load = async () => {
+          const local = (await rpc().snapshot({}, { location })) as Snapshot
+          if (!local.home || local.home === location.directory) return local
+          return (await rpc().snapshot({}, { location: { directory: local.home } })) as Snapshot
+        }
+        load()
+          .then((result) => live && setSnapshot(result))
           .catch(() => live && setSnapshot(undefined))
       })
       const shown = () => {
         const current = snapshot()
         return current && current.orchestrator === props.sessionID ? view(current) : undefined
       }
+      const member = () => {
+        const current = snapshot()
+        return current ? membership(current, props.sessionID) : undefined
+      }
+      const openOrchestrator = () => {
+        const id = snapshot()?.orchestrator
+        if (id) open(id)
+      }
       return (
+        <>
+        <Show when={member()}>
+          {(note) => (
+            <box flexDirection="column" flexShrink={0} onMouseUp={openOrchestrator}>
+              <text fg={context.theme.text.base}>
+                <b>{note().heading}</b>
+              </text>
+              <text>
+                <span style={{ fg: color(note().tone) }}>{note().marker} </span>
+                <span style={{ fg: context.theme.text.muted }}>{note().meta}</span>
+              </text>
+            </box>
+          )}
+        </Show>
         <Show when={shown()}>
           {(board) => (
             <box flexDirection="column" flexShrink={0}>
@@ -65,6 +92,7 @@ export default Plugin.define({
             </box>
           )}
         </Show>
+        </>
       )
     }
 

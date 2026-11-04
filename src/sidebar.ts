@@ -30,6 +30,27 @@ const LOOK: Record<WorkerState, { marker: string; tone: Tone; rank: number }> = 
 
 const isOpen = (state: WorkerState) => state !== "closed" && state !== "gone"
 
+export interface Membership {
+  heading: string
+  marker: string
+  tone: Tone
+  meta: string
+}
+
+/** The note shown in a worker's own sidebar: it is joined to the orchestrator and how it is tracked. */
+export function membership(snapshot: Snapshot, sessionID: string, now = Date.now()): Membership | undefined {
+  const worker = snapshot.workers.find((w) => w.id === sessionID)
+  if (!worker || !isOpen(worker.state) || !snapshot.orchestrator) return undefined
+  return {
+    heading: worker.attached ? "Orchestrator · joined" : "Orchestrator · worker",
+    marker: LOOK[worker.state].marker,
+    tone: LOOK[worker.state].tone,
+    meta: [worker.detail ? `${worker.state}: ${worker.detail}` : worker.state, worker.space, `${formatAge(now - worker.updated)} ago`]
+      .filter(Boolean)
+      .join(" · "),
+  }
+}
+
 /** Open workers sorted by what needs attention first; closed ones are only counted. */
 export function view(snapshot: Snapshot, now = Date.now()): View {
   const open = snapshot.workers.filter((w) => isOpen(w.state))

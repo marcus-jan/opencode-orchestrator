@@ -3,8 +3,18 @@ import type { WorkerState } from "./registry"
 
 /** What the sidebar needs to draw the worker list. */
 export interface Snapshot {
+  /** The orchestrator's home directory, so sidebars elsewhere know where to ask. */
+  home?: string
   orchestrator?: string
-  workers: { id: string; title: string; state: WorkerState; detail?: string; space?: string; updated: number }[]
+  workers: {
+    id: string
+    title: string
+    state: WorkerState
+    detail?: string
+    space?: string
+    attached?: boolean
+    updated: number
+  }[]
 }
 
 export const Orchestrator = Rpc.define({

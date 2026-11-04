@@ -6,7 +6,7 @@ import { runtime } from "../src/herdr"
 import plugin, { parseOptions } from "../src/index"
 import type { WorkerState } from "../src/registry"
 import type { Snapshot } from "../src/rpc"
-import { view } from "../src/sidebar"
+import { membership, view } from "../src/sidebar"
 
 const home = mkdtempSync(path.join(tmpdir(), "orchestrator-"))
 mkdirSync(path.join(home, "web", ".git"), { recursive: true })
@@ -198,11 +198,13 @@ test("parseOptions resolves defaults and validates types", () => {
 })
 
 test("stays inactive outside its home directory", async () => {
-  const { ctx, tools, commands, calls } = fakeContext("/elsewhere", { home })
+  const { ctx, tools, commands, calls, rpcHandlers } = fakeContext("/elsewhere", { home })
   await plugin.setup(ctx as never)
   expect(tools.size).toBe(0)
   expect([...commands.keys()]).toEqual(["join-orchestrator"])
   expect(calls).toEqual([])
+  // Points sidebars on sessions elsewhere at the orchestrator's home.
+  expect(await rpcHandlers.snapshot({})).toEqual({ home, workers: [] })
 })
 
 test("lists git projects and tells the orchestrator how to name workers", async () => {
@@ -271,6 +273,7 @@ test("serves the sidebar a snapshot and signals each worker change", async () =>
   expect(calls.filter((c) => c.method === "changed").length).toBeGreaterThan(before)
   const snapshot = (await rpcHandlers.snapshot({})) as Snapshot
   expect(snapshot.orchestrator).toBe("ses_1")
+  expect(snapshot.home).toBe(home)
   expect(snapshot.workers).toEqual([
     { id: "ses_2", title: "Fix Login", state: "running", space: "w10", updated: expect.any(Number) },
   ])
@@ -301,6 +304,28 @@ test("sidebar view puts workers needing attention first and counts closed ones",
   ])
   expect(result.rows[0].meta).toBe("blocked: permission: bash · 10m ago")
   expect(result.rows[2].meta).toBe("done · w1 · 10m ago")
+})
+
+test("a worker's own sidebar says it is joined to the orchestrator", () => {
+  const now = 5 * 60_000
+  const snapshot: Snapshot = {
+    orchestrator: "ses_1",
+    workers: [
+      { id: "ses_2", title: "Spawned", state: "running", space: "w10", updated: 0 },
+      { id: "ses_3", title: "Joined", state: "done", attached: true, updated: now },
+      { id: "ses_4", title: "Old", state: "closed", updated: 0 },
+    ],
+  }
+  expect(membership(snapshot, "ses_2", now)).toEqual({
+    heading: "Orchestrator · worker",
+    marker: "●",
+    tone: "info",
+    meta: "running · w10 · 5m ago",
+  })
+  expect(membership(snapshot, "ses_3", now)?.heading).toBe("Orchestrator · joined")
+  expect(membership(snapshot, "ses_4", now)).toBeUndefined()
+  expect(membership(snapshot, "ses_9", now)).toBeUndefined()
+  expect(membership({ workers: snapshot.workers }, "ses_2", now)).toBeUndefined()
 })
 
 test("picks branch and base defaults: develop, master for hotfixes, main as a fallback", async () => {

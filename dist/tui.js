@@ -1,7 +1,7 @@
 // @bun
 // src/tui.tsx
-import { createTextNode as _$createTextNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { effect as _$effect } from "opentui:runtime-module:%40opentui%2Fsolid";
+import { createTextNode as _$createTextNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { insertNode as _$insertNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { insert as _$insert } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { setProp as _$setProp } from "opentui:runtime-module:%40opentui%2Fsolid";
@@ -91,6 +91,17 @@ var LOOK = {
   }
 };
 var isOpen = (state) => state !== "closed" && state !== "gone";
+function membership(snapshot, sessionID, now = Date.now()) {
+  const worker = snapshot.workers.find((w) => w.id === sessionID);
+  if (!worker || !isOpen(worker.state) || !snapshot.orchestrator)
+    return;
+  return {
+    heading: worker.attached ? "Orchestrator \xB7 joined" : "Orchestrator \xB7 worker",
+    marker: LOOK[worker.state].marker,
+    tone: LOOK[worker.state].tone,
+    meta: [worker.detail ? `${worker.state}: ${worker.detail}` : worker.state, worker.space, `${formatAge(now - worker.updated)} ago`].filter(Boolean).join(" \xB7 ")
+  };
+}
 function view(snapshot, now = Date.now()) {
   const open = snapshot.workers.filter((w) => isOpen(w.state));
   const rows = open.toSorted((a, b) => LOOK[a.state].rank - LOOK[b.state].rank || b.updated - a.updated).map((w) => ({
@@ -139,74 +150,128 @@ var tui_default = Plugin.define({
         onCleanup(() => live = false);
         if (!location)
           return setSnapshot(undefined);
-        rpc().snapshot({}, {
-          location
-        }).then((result) => live && setSnapshot(result)).catch(() => live && setSnapshot(undefined));
+        const load = async () => {
+          const local = await rpc().snapshot({}, {
+            location
+          });
+          if (!local.home || local.home === location.directory)
+            return local;
+          return await rpc().snapshot({}, {
+            location: {
+              directory: local.home
+            }
+          });
+        };
+        load().then((result) => live && setSnapshot(result)).catch(() => live && setSnapshot(undefined));
       });
       const shown = () => {
         const current = snapshot();
         return current && current.orchestrator === props.sessionID ? view(current) : undefined;
       };
-      return _$createComponent(Show, {
+      const member = () => {
+        const current = snapshot();
+        return current ? membership(current, props.sessionID) : undefined;
+      };
+      const openOrchestrator = () => {
+        const id = snapshot()?.orchestrator;
+        if (id)
+          open(id);
+      };
+      return [_$createComponent(Show, {
+        get when() {
+          return member();
+        },
+        children: (note) => (() => {
+          var _el$ = _$createElement("box"), _el$2 = _$createElement("text"), _el$3 = _$createElement("b"), _el$4 = _$createElement("text"), _el$5 = _$createElement("span"), _el$6 = _$createTextNode(` `), _el$7 = _$createElement("span");
+          _$insertNode(_el$, _el$2);
+          _$insertNode(_el$, _el$4);
+          _$setProp(_el$, "flexDirection", "column");
+          _$setProp(_el$, "flexShrink", 0);
+          _$setProp(_el$, "onMouseUp", openOrchestrator);
+          _$insertNode(_el$2, _el$3);
+          _$insert(_el$3, () => note().heading);
+          _$insertNode(_el$4, _el$5);
+          _$insertNode(_el$4, _el$7);
+          _$insertNode(_el$5, _el$6);
+          _$insert(_el$5, () => note().marker, _el$6);
+          _$insert(_el$7, () => note().meta);
+          _$effect((_p$) => {
+            var _v$ = context.theme.text.base, _v$2 = {
+              fg: color(note().tone)
+            }, _v$3 = {
+              fg: context.theme.text.muted
+            };
+            _v$ !== _p$.e && (_p$.e = _$setProp(_el$2, "fg", _v$, _p$.e));
+            _v$2 !== _p$.t && (_p$.t = _$setProp(_el$5, "style", _v$2, _p$.t));
+            _v$3 !== _p$.a && (_p$.a = _$setProp(_el$7, "style", _v$3, _p$.a));
+            return _p$;
+          }, {
+            e: undefined,
+            t: undefined,
+            a: undefined
+          });
+          return _el$;
+        })()
+      }), _$createComponent(Show, {
         get when() {
           return shown();
         },
         children: (board) => (() => {
-          var _el$ = _$createElement("box"), _el$2 = _$createElement("text"), _el$3 = _$createElement("b");
-          _$insertNode(_el$, _el$2);
-          _$setProp(_el$, "flexDirection", "column");
-          _$setProp(_el$, "flexShrink", 0);
-          _$insertNode(_el$2, _el$3);
-          _$insert(_el$3, () => board().heading);
-          _$insert(_el$, _$createComponent(For, {
+          var _el$8 = _$createElement("box"), _el$9 = _$createElement("text"), _el$0 = _$createElement("b");
+          _$insertNode(_el$8, _el$9);
+          _$setProp(_el$8, "flexDirection", "column");
+          _$setProp(_el$8, "flexShrink", 0);
+          _$insertNode(_el$9, _el$0);
+          _$insert(_el$0, () => board().heading);
+          _$insert(_el$8, _$createComponent(For, {
             get each() {
               return board().rows;
             },
             children: (row) => (() => {
-              var _el$5 = _$createElement("box"), _el$6 = _$createElement("text"), _el$7 = _$createElement("span"), _el$8 = _$createTextNode(` `), _el$9 = _$createElement("span"), _el$0 = _$createElement("text");
-              _$insertNode(_el$5, _el$6);
-              _$insertNode(_el$5, _el$0);
-              _$setProp(_el$5, "flexDirection", "column");
-              _$setProp(_el$5, "onMouseUp", () => open(row.id));
-              _$insertNode(_el$6, _el$7);
-              _$insertNode(_el$6, _el$9);
-              _$insertNode(_el$7, _el$8);
-              _$insert(_el$7, () => row.marker, _el$8);
-              _$insert(_el$9, () => row.title);
-              _$insert(_el$0, () => `  ${row.meta}`);
+              var _el$10 = _$createElement("box"), _el$11 = _$createElement("text"), _el$12 = _$createElement("span"), _el$13 = _$createTextNode(` `), _el$14 = _$createElement("span"), _el$15 = _$createElement("text");
+              _$insertNode(_el$10, _el$11);
+              _$insertNode(_el$10, _el$15);
+              _$setProp(_el$10, "flexDirection", "column");
+              _$setProp(_el$10, "onMouseUp", () => open(row.id));
+              _$insertNode(_el$11, _el$12);
+              _$insertNode(_el$11, _el$14);
+              _$insertNode(_el$12, _el$13);
+              _$insert(_el$12, () => row.marker, _el$13);
+              _$insert(_el$14, () => row.title);
+              _$insert(_el$15, () => `  ${row.meta}`);
               _$effect((_p$) => {
-                var _v$ = {
+                var _v$4 = {
                   fg: color(row.tone)
-                }, _v$2 = {
+                }, _v$5 = {
                   fg: context.theme.text.base
-                }, _v$3 = context.theme.text.muted;
-                _v$ !== _p$.e && (_p$.e = _$setProp(_el$7, "style", _v$, _p$.e));
-                _v$2 !== _p$.t && (_p$.t = _$setProp(_el$9, "style", _v$2, _p$.t));
-                _v$3 !== _p$.a && (_p$.a = _$setProp(_el$0, "fg", _v$3, _p$.a));
+                }, _v$6 = context.theme.text.muted;
+                _v$4 !== _p$.e && (_p$.e = _$setProp(_el$12, "style", _v$4, _p$.e));
+                _v$5 !== _p$.t && (_p$.t = _$setProp(_el$14, "style", _v$5, _p$.t));
+                _v$6 !== _p$.a && (_p$.a = _$setProp(_el$15, "fg", _v$6, _p$.a));
                 return _p$;
               }, {
                 e: undefined,
                 t: undefined,
                 a: undefined
               });
-              return _el$5;
+              return _el$10;
             })()
           }), null);
-          _$insert(_el$, _$createComponent(Show, {
+          _$insert(_el$8, _$createComponent(Show, {
             get when() {
               return board().closed > 0;
             },
             get children() {
-              var _el$4 = _$createElement("text");
-              _$insert(_el$4, () => `${board().closed} closed`);
-              _$effect((_$p) => _$setProp(_el$4, "fg", context.theme.text.muted, _$p));
-              return _el$4;
+              var _el$1 = _$createElement("text");
+              _$insert(_el$1, () => `${board().closed} closed`);
+              _$effect((_$p) => _$setProp(_el$1, "fg", context.theme.text.muted, _$p));
+              return _el$1;
             }
           }), null);
-          _$effect((_$p) => _$setProp(_el$2, "fg", context.theme.text.base, _$p));
-          return _el$;
+          _$effect((_$p) => _$setProp(_el$9, "fg", context.theme.text.base, _$p));
+          return _el$8;
         })()
-      });
+      })];
     };
     context.ui.slot({
       append: "sidebar.content",
