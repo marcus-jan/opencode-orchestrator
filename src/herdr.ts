@@ -45,6 +45,16 @@ export function herdr(bin: string) {
   })
   return {
     available: () => run(bin, ["workspace", "list"]).then(() => true, () => false),
+    /** IDs of every open space, or undefined when herdr can't be reached (so nothing looks closed). */
+    spaces: async () =>
+      call(["workspace", "list"]).then(
+        (result) => new Set<string>((result.workspaces ?? []).map((space: Space) => space.workspace_id)),
+        () => undefined,
+      ),
+    closeSpace: (id: string) => call(["workspace", "close", id]),
+    /** Removes the space's worktree checkout and closes the space. */
+    removeWorktree: (space: string, force: boolean) =>
+      call(["worktree", "remove", "--workspace", space, ...(force ? ["--force"] : [])]),
     /** Repo's main (non-linked) space, so new worktrees nest under it in the sidebar. */
     repoSpace: async (root: string) =>
       (await call(["workspace", "list"])).workspaces?.find(
@@ -98,3 +108,12 @@ export async function resolveBase(root: string, candidates: string[]) {
 
 export const branchExists = (root: string, branch: string) =>
   run("git", ["-C", root, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true, () => false)
+
+export const branchOnOrigin = (root: string, branch: string) =>
+  run("git", ["-C", root, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).then(() => true, () => false)
+
+export const removeGitWorktree = (root: string, checkout: string, force: boolean) =>
+  run("git", ["-C", root, "worktree", "remove", ...(force ? ["--force"] : []), checkout])
+
+export const deleteBranch = (root: string, branch: string, force: boolean) =>
+  run("git", ["-C", root, "branch", force ? "-D" : "-d", branch])

@@ -1,4 +1,4 @@
-export type WorkerState = "queued" | "running" | "blocked" | "done" | "failed" | "interrupted" | "gone"
+export type WorkerState = "queued" | "running" | "blocked" | "done" | "failed" | "interrupted" | "closed" | "gone"
 
 export interface Worker {
   id: string
@@ -6,8 +6,14 @@ export interface Worker {
   directory: string
   /** Git project root the worker belongs to, when it was spawned inside one. */
   project?: string
-  /** Worktree name, when the worker was given its own worktree. */
+  /** Branch name, when the worker was given its own worktree. */
   worktree?: string
+  /** Root of the worker's worktree checkout (directory may be a subfolder of it). */
+  checkout?: string
+  /** Who closed the worker: the user by hand, or the orchestrator via close_worker. */
+  closedBy?: "user" | "orchestrator"
+  /** Parts still around after a close (worktree, branch, herdr space). */
+  leftovers?: string[]
   /** Herdr workspace ID the worker's TUI was opened in. */
   space?: string
   /** Why the orchestrator started this worker. */
@@ -52,10 +58,41 @@ export function transitionFor(event: AnyEvent): Transition | undefined {
     case "form.replied":
     case "form.cancelled":
       return { sessionID: data.sessionID, state: "running", unblock: true }
-    case "session.deleted":
-      return { sessionID: data.sessionID, state: "gone" }
   }
   return undefined
+}
+
+export const isClosed = (worker: Worker) => worker.state === "closed" || worker.state === "gone"
+
+/** Worktree root for a worker; older entries only recorded the directory. */
+export const checkoutOf = (worker: Worker) => worker.checkout ?? (worker.worktree ? worker.directory : undefined)
+
+/** What still exists for a worker. `space` is undefined when unknown (herdr unreachable) or not used. */
+export interface Presence {
+  session: boolean
+  space?: boolean
+  worktree?: boolean
+  branch?: { exists: boolean; pushed: boolean }
+}
+
+/** Anything the user would want cleaned up. A lingering session doesn't count: it costs nothing. */
+export function leftovers(worker: Worker, p: Presence) {
+  return [
+    worker.space && p.space && `herdr space ${worker.space}`,
+    p.worktree && `worktree ${checkoutOf(worker)}`,
+    p.branch?.exists && `branch ${worker.worktree} (${p.branch.pushed ? "pushed to origin" : "not on origin"})`,
+  ].filter((part): part is string => !!part)
+}
+
+/** Detects a worker closed outside the orchestrator: any of its space, worktree or session is gone. */
+export function closure(worker: Worker, p: Presence) {
+  const missing = [
+    worker.space && p.space === false && `herdr space ${worker.space} closed`,
+    checkoutOf(worker) && p.worktree === false && "worktree removed",
+    !p.session && "session deleted",
+  ].filter((part): part is string => !!part)
+  if (!missing.length) return undefined
+  return { detail: `closed manually: ${missing.join(", ")}`, leftovers: leftovers(worker, p) }
 }
 
 export const EVENT_TYPES = [
@@ -74,7 +111,7 @@ export const EVENT_TYPES = [
 /** Applies a transition. Returns the updated worker, or undefined when nothing changed. */
 export function apply(registry: Registry, t: Transition, now = Date.now()): Worker | undefined {
   const worker = registry[t.sessionID]
-  if (!worker) return undefined
+  if (!worker || isClosed(worker)) return undefined
   if (worker.state === t.state && worker.detail === t.detail) return undefined
   // A late permission/form reply must not resurrect a worker that already finished.
   if (t.unblock && worker.state !== "blocked") return undefined
@@ -89,7 +126,8 @@ export function board(registry: Registry, now = Date.now()) {
   return workers
     .map((w) => {
       const age = formatAge(now - w.updated)
-      const detail = w.detail ? ` (${w.detail})` : ""
+      const notes = [w.detail, w.leftovers?.length && `left: ${w.leftovers.join(", ")}`].filter(Boolean)
+      const detail = notes.length ? ` (${notes.join("; ")})` : ""
       const tree = (w.worktree ? ` [worktree ${w.worktree}]` : "") + (w.space ? ` [herdr ${w.space}]` : "")
       return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory}${tree} — ${age} ago${detail}`
     })

@@ -19,7 +19,7 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
     - The orchestrator picks the title (space label) and branch name itself, following the repo's
       convention (`feat/`, `fix/`, `chore/`, `docs/`, `hotfix/`; Jira keys stay uppercase).
     - Without herdr, project workers fall back to a headless OpenCode worktree.
-    - Worktrees and spaces are never removed automatically.
+    - Worktrees, spaces and branches are never removed automatically; only `close_worker` removes them.
     - `why` (required) is a sentence or two on where the request came from and what the user wants. It
       is pinned into the worker as a standing context entry (`orchestrator-origin`) together with the
       orchestrator session, project, branch, base, directory and herdr space, so the worker still knows
@@ -28,8 +28,10 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
   inside a repo or a herdr worktree don't load it (OpenCode stops at the project root).
   - `list_workers` shows the board
   - `message_worker` sends a follow-up (queued, or `steer` to interject)
+  - `close_worker` cleans up a worker when you ask: removes its worktree and closes its herdr space, and optionally deletes its branch (`branch: true`) and session (`session: true`). Failures are reported; `force` is only for when you confirm
   - `forget_worker` stops tracking a worker
 - The plugin watches server events and tracks each worker as `queued → running → done | failed | interrupted`. A worker waiting on a permission prompt or a question shows as `blocked`.
+- Every `sweepSeconds` (and on `list_workers` or a deleted session) the plugin checks each worker's herdr space, worktree and session. If you closed any of them yourself, the worker becomes `closed` with a "closed manually" note. If something is left (an open space, a worktree on disk, the branch), the orchestrator is woken to ask whether to clean it up; otherwise it only gets a one-line note.
 - The board is attached to the orchestrator as a context entry. It refreshes on every change and costs no extra turns.
 - When a worker is `done`, `failed`, or `blocked`, the plugin queues a short synthetic note in the orchestrator without starting a turn.
 - `/orchestrator` pins the current session as the orchestrator instead and prints the `scrawl send` command for it.
@@ -42,7 +44,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.1", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.2", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```
@@ -55,6 +57,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
 | `herdr`  | `$HERDR_BIN_PATH` or `~/.local/bin/herdr` | Herdr binary used to open worker spaces; `false` keeps workers headless |
 | `model`  | the spawning session's model | Worker model as `providerID/modelID`. If it isn't available, workers use the spawning session's model (noted in the spawn result); with neither, the spawn fails instead of using OpenCode's free models |
+| `sweepSeconds` | `60`             | How often to check for workers you closed by hand; `0` disables the timer |
 
 ## Sending captures
 

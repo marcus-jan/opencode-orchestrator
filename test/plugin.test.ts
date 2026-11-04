@@ -23,6 +23,8 @@ afterEach(() => void Object.assign(runtime, { exec: realExec, sleep: realSleep }
 /** Fake git + herdr. `web` has develop/master; `api` only main; branch feat/taken exists. */
 function fakeShell({ herdr = true, busy = 0 } = {}) {
   const runs: string[][] = []
+  const spaces = new Map<string, string | undefined>([["w1", undefined]])
+  const branches = new Set(["feat/taken"])
   runtime.sleep = async () => {}
   const refs: Record<string, string[]> = { web: ["origin/develop", "origin/master"], api: ["main"] }
   let next = 9
@@ -32,7 +34,9 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
       const repo = path.basename(args[1])
       const ref = args.at(-1)!
       if (args[2] === "fetch") return ""
-      if (ref === "refs/heads/feat/taken") return "ok"
+      if (ref.startsWith("refs/heads/") && branches.has(ref.slice(11))) return "ok"
+      if (args[2] === "worktree" && args[3] === "remove") return void rmSync(ref, { recursive: true, force: true }), ""
+      if (args[2] === "branch" && branches.delete(ref)) return ""
       if (ref.endsWith("^{commit}") && refs[repo]?.includes(ref.slice(0, -9))) return "ok"
       throw new Error("missing")
     }
@@ -41,13 +45,23 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     const json = (result: unknown) => JSON.stringify({ id: "cli", result })
     const opened = (cwd: string, extra = {}) => {
       const id = `w${++next}`
+      spaces.set(id, (extra as { worktree?: { path: string } }).worktree?.path)
       return json({ workspace: { workspace_id: id }, root_pane: { pane_id: `${id}:p1`, cwd }, ...extra })
     }
     if (args[0] === "workspace" && args[1] === "list") {
-      return json({ workspaces: [{ workspace_id: "w1", label: "web", worktree: { repo_root: path.join(home, "web"), is_linked_worktree: false } }] })
+      const main = { repo_root: path.join(home, "web"), is_linked_worktree: false }
+      return json({ workspaces: [...spaces.keys()].map((id) => ({ workspace_id: id, label: id, ...(id === "w1" && { worktree: main }) })) })
+    }
+    if (args[0] === "workspace" && args[1] === "close") return spaces.delete(args[2]), json({})
+    if (args[0] === "worktree" && args[1] === "remove") {
+      rmSync(spaces.get(flag("--workspace"))!, { recursive: true, force: true })
+      spaces.delete(flag("--workspace"))
+      return json({})
     }
     if (args[0] === "worktree") {
       const dir = path.join(home, ".herdr", "web", flag("--branch").replace(/\//g, "-"))
+      mkdirSync(dir, { recursive: true })
+      branches.add(flag("--branch"))
       return opened(dir, { worktree: { path: dir } })
     }
     if (args[0] === "workspace" && args[1] === "create") return opened(flag("--cwd"))
@@ -56,13 +70,14 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     }
     return json({})
   }
-  return runs
+  return Object.assign(runs, { spaces, branches })
 }
 
 function fakeContext(directory: string, options: Record<string, unknown> = {}) {
   const store = new Map<string, unknown>()
   const tools = new Map<string, any>()
   const calls: { method: string; input: any }[] = []
+  const deleted = new Set<string>()
   let next = 0
   let push: ((event: unknown) => void) | undefined
   const queue: unknown[] = []
@@ -71,7 +86,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
     return result(input)
   }
   const ctx = {
-    options: { herdr: "/bin/herdr", ...options },
+    options: { herdr: "/bin/herdr", sweepSeconds: 0, ...options },
     location: { directory },
     storage: {
       get: async (key: string) => store.get(key),
@@ -79,7 +94,11 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
     },
     session: {
       create: record("create", () => ({ id: `ses_${++next}`, projectID: "prj_1" })),
-      get: record("get", (input) => ({ id: input.sessionID, model: { id: "opus", providerID: "anthropic" } })),
+      get: record("get", (input) => {
+        if (deleted.has(input.sessionID)) throw { _tag: "SessionNotFoundError", message: `Session not found: ${input.sessionID}` }
+        return { id: input.sessionID, model: { id: "opus", providerID: "anthropic" } }
+      }),
+      remove: record("remove", (input) => void deleted.add(input.sessionID)),
       update: record("update"),
       move: record("move"),
       prompt: record("prompt"),
@@ -112,7 +131,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       }),
     },
   }
-  return { ctx, tools, calls, store, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
+  return { ctx, tools, calls, store, deleted, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
@@ -283,5 +302,77 @@ test("falls back to headless OpenCode worktrees when herdr is unavailable", asyn
   expect(calls.find((c) => c.method === "worktree")?.input).toEqual({ projectID: "prj_1", name: "fix-a", branch: "origin/develop" })
   expect(calls.find((c) => c.method === "move")?.input.directory).toBe(path.join(home, ".worktrees", "fix-a"))
   expect(result.content).toContain("headless (herdr unavailable)")
+  await cleanup()
+})
+
+const spawnLogin = (tools: Map<string, any>) =>
+  tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "p", why: "w", project: "web", branch: "fix/ABC-1-login" })
+const loginTree = path.join(home, ".herdr", "web", "fix-ABC-1-login")
+const closedNotes = (calls: { method: string; input: any }[]) =>
+  calls.filter((c) => c.method === "synthetic" && c.input.description?.endsWith("closed")).map((c) => c.input)
+
+test("asks about leftovers when the user closes a worker's herdr space and worktree by hand", async () => {
+  const shell = fakeShell()
+  const { tools, calls, cleanup } = await started()
+  await spawnLogin(tools)
+  rmSync(loginTree, { recursive: true, force: true })
+  shell.spaces.delete("w10")
+
+  const listed = (await tools.get("list_workers").execute({})).content
+  expect(listed).toContain("[closed] Fix Login")
+  expect(listed).toContain("closed manually: herdr space w10 closed, worktree removed; left: branch fix/ABC-1-login (not on origin)")
+  const [note] = closedNotes(calls)
+  expect(note.resume).toBe(true)
+  expect(note.text).toContain("Still left: branch fix/ABC-1-login (not on origin)")
+  expect(note.text).toContain("Ask the user whether to clean these up")
+
+  // Cleaning up after a manual close keeps it marked as closed by the user.
+  const result = await tools.get("close_worker").execute({ sessionID: "ses_2", branch: true })
+  expect(result.content).toBe("Fix Login: deleted branch fix/ABC-1-login.")
+  expect(shell.branches.has("fix/ABC-1-login")).toBe(false)
+  expect((await tools.get("list_workers").execute({})).content).not.toContain("left:")
+  expect(closedNotes(calls)).toHaveLength(1)
+  await cleanup()
+})
+
+test("a deleted session with its worktree still around asks about the worktree", async () => {
+  fakeShell()
+  const { tools, calls, deleted, emit, cleanup } = await started()
+  await spawnLogin(tools)
+  deleted.add("ses_2")
+  emit({ type: "session.deleted", data: { sessionID: "ses_2" } })
+  await settle()
+  const [note] = closedNotes(calls)
+  expect(note.text).toContain("was closed manually: session deleted")
+  expect(note.text).toContain(`herdr space w10; worktree ${loginTree}; branch fix/ABC-1-login`)
+  expect(note.resume).toBe(true)
+  await cleanup()
+})
+
+test("records a closed idea space with nothing left without waking the orchestrator", async () => {
+  const shell = fakeShell()
+  const { tools, calls, cleanup } = await started()
+  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
+  shell.spaces.delete("w10")
+  await tools.get("list_workers").execute({})
+  const [note] = closedNotes(calls)
+  expect(note.text).toBe('Worker "Idea" (ses_2) was closed manually: herdr space w10 closed; nothing left to clean up.')
+  expect(note.resume).toBe(false)
+  await cleanup()
+})
+
+test("close_worker removes the worktree and space without reporting a manual close", async () => {
+  const shell = fakeShell()
+  const { tools, calls, cleanup } = await started()
+  await spawnLogin(tools)
+  const result = await tools.get("close_worker").execute({ sessionID: "ses_2" })
+  expect(result.content).toBe(
+    "Fix Login: removed worktree and closed herdr space w10.\nStill left: branch fix/ABC-1-login (not on origin).",
+  )
+  expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
+  expect(shell.spaces.has("w10")).toBe(false)
+  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Fix Login")
+  expect((await tools.get("list_workers").execute({})).content).toContain("closed by orchestrator")
+  expect(closedNotes(calls)).toHaveLength(0)
   await cleanup()
 })
