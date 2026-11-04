@@ -78,6 +78,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
   const tools = new Map<string, any>()
   const calls: { method: string; input: any }[] = []
   const deleted = new Set<string>()
+  const sessions: { id: string; parentID?: string }[] = []
   let next = 0
   let push: ((event: unknown) => void) | undefined
   const queue: unknown[] = []
@@ -102,7 +103,11 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       update: record("update"),
       move: record("move"),
       prompt: record("prompt"),
-      synthetic: record("synthetic"),
+      synthetic: record("synthetic", (input) => {
+        if (deleted.has(input.sessionID)) throw { _tag: "SessionNotFoundError", message: `Session not found: ${input.sessionID}` }
+        return {}
+      }),
+      list: record("list", () => ({ data: sessions.filter((s) => !deleted.has(s.id)) })),
       instructions: { entry: { put: record("board") } },
     },
     model: {
@@ -131,7 +136,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       }),
     },
   }
-  return { ctx, tools, calls, store, deleted, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
+  return { ctx, tools, calls, store, deleted, sessions, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
@@ -374,5 +379,33 @@ test("close_worker removes the worktree and space without reporting a manual clo
   expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Fix Login")
   expect((await tools.get("list_workers").execute({})).content).toContain("closed by orchestrator")
   expect(closedNotes(calls)).toHaveLength(0)
+  await cleanup()
+})
+
+test("re-pins the most recent other session when the orchestrator is deleted", async () => {
+  fakeShell()
+  const { tools, calls, deleted, sessions, emit, store, cleanup } = await started()
+  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "think", why: "dictation" })
+  sessions.push({ id: "ses_2" }, { id: "ses_sub", parentID: "ses_9" }, { id: "ses_9" })
+  deleted.add("ses_1")
+  emit({ type: "session.deleted", data: { sessionID: "ses_1" } })
+  await settle()
+  expect(store.get("orchestrator")).toBe("ses_9")
+  const catchUp = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_9")
+  expect(catchUp?.input.text).toContain("previous orchestrator session (ses_1) was deleted")
+  expect(calls.some((c) => c.method === "board" && c.input.sessionID === "ses_9")).toBe(true)
+  await cleanup()
+})
+
+test("replays alerts that could not reach a deleted orchestrator", async () => {
+  fakeShell()
+  const { tools, calls, deleted, emit, store, cleanup } = await started()
+  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "think", why: "dictation" })
+  deleted.add("ses_1")
+  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_2" } })
+  await settle()
+  expect(store.get("orchestrator")).toBe("ses_3")
+  const catchUp = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_3")
+  expect(catchUp?.input.text).toContain('Missed while there was no orchestrator:\n- Worker "Idea" (ses_2) is now done.')
   await cleanup()
 })

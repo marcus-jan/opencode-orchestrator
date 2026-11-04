@@ -142,18 +142,69 @@ export default Plugin.define({
         .catch((error: unknown) => console.warn(`[${ID}]`, "failed to publish board", error))
     }
 
-    const notify = async (worker: Worker) => {
-      if (!options.notify || !orchestratorID) return
-      const detail = worker.detail ? `: ${worker.detail}` : ""
+    // Alerts that could not be delivered because the orchestrator session was gone; replayed on re-pin.
+    const missed: { text: string; resume: boolean }[] = []
+
+    /**
+     * Pins a replacement after the orchestrator session disappears: the most recently used other root
+     * session in home that is not a worker, else a new one. It gets a catch-up of missed alerts.
+     */
+    const repin = async (previous?: string) => {
+      const listed = previous
+        ? await ctx.session
+            .list({ directory: options.home, parentID: null, order: "desc", limit: 20 })
+            .catch(() => undefined)
+        : undefined
+      const candidate = listed?.data.find((session) => session.id !== previous && !session.parentID && !registry[session.id])
+      const sessionID =
+        candidate?.id ?? (await ctx.session.create({ title: options.title, location: { directory: options.home } })).id
+      if (previous) console.warn(`[${ID}]`, `orchestrator ${previous} is gone; pinned ${sessionID}`)
+      await pin(sessionID)
+      const replay = missed.splice(0)
+      if (previous || replay.length) {
+        const text = [
+          previous
+            ? `The previous orchestrator session (${previous}) was deleted, so this session is now the orchestrator.`
+            : "This session is now the orchestrator.",
+          replay.length ? `Missed while there was no orchestrator:\n${replay.map((m) => `- ${m.text}`).join("\n")}` : "",
+          `Send captures here with: scrawl send <bundle> --session ${sessionID}`,
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+        await ctx.session
+          .synthetic({
+            sessionID,
+            text,
+            description: "Orchestrator re-pinned",
+            delivery: "queue",
+            resume: replay.some((m) => m.resume),
+          })
+          .catch((error: unknown) => console.warn(`[${ID}]`, "failed to post catch-up", error))
+      }
+      return sessionID
+    }
+
+    /** Posts an alert to the orchestrator, re-pinning first if its session was deleted. */
+    const tell = async (text: string, description: string, resume: boolean) => {
+      if (!options.notify) return
+      const sessionID = orchestratorID
+      if (!sessionID) {
+        missed.push({ text, resume })
+        await repin()
+        return
+      }
       await ctx.session
-        .synthetic({
-          sessionID: orchestratorID,
-          text: `Worker "${worker.title}" (${worker.id}) is now ${worker.state}${detail}.`,
-          description: `${worker.title} ${worker.state}`,
-          delivery: "queue",
-          resume: false,
+        .synthetic({ sessionID, text, description, delivery: "queue", resume })
+        .catch(async (error: unknown) => {
+          if (!notFound(error)) return console.warn(`[${ID}]`, "failed to notify orchestrator", error)
+          missed.push({ text, resume })
+          await repin(sessionID)
         })
-        .catch((error: unknown) => console.warn(`[${ID}]`, "failed to notify orchestrator", error))
+    }
+
+    const notify = async (worker: Worker) => {
+      const detail = worker.detail ? `: ${worker.detail}` : ""
+      await tell(`Worker "${worker.title}" (${worker.id}) is now ${worker.state}${detail}.`, `${worker.title} ${worker.state}`, false)
     }
 
     const mux = options.herdr ? herdr(options.herdr) : undefined
@@ -173,23 +224,14 @@ export default Plugin.define({
     }
 
     const notifyClosed = async (worker: Worker) => {
-      if (!options.notify || !orchestratorID) return
       const left = worker.leftovers ?? []
       const text = left.length
         ? `Worker "${worker.title}" (${worker.id}) was ${worker.detail}. Still left: ${left.join("; ")}. ` +
           `Ask the user whether to clean these up. If they agree, call close_worker for ${worker.id} ` +
           `(pass branch: true only if they want the branch deleted). Do not clean up without asking.`
         : `Worker "${worker.title}" (${worker.id}) was ${worker.detail}; nothing left to clean up.`
-      await ctx.session
-        .synthetic({
-          sessionID: orchestratorID,
-          text,
-          description: `${worker.title} closed`,
-          delivery: "queue",
-          // Only wake the orchestrator when there is something to ask about.
-          resume: left.length > 0,
-        })
-        .catch((error: unknown) => console.warn(`[${ID}]`, "failed to notify orchestrator", error))
+      // Only wake the orchestrator when there is something to ask about.
+      await tell(text, `${worker.title} closed`, left.length > 0)
     }
 
     // Workers close_worker is tearing down, so a sweep mid-way doesn't report them as closed by hand.
@@ -224,12 +266,13 @@ export default Plugin.define({
 
     const ensureOrchestrator = async () => {
       if (orchestratorID) {
-        const existing = await ctx.session.get({ sessionID: orchestratorID }).catch(() => undefined)
-        if (existing) return orchestratorID
+        const exists = await ctx.session.get({ sessionID: orchestratorID }).then(
+          () => true,
+          (error: unknown) => !notFound(error),
+        )
+        if (exists) return orchestratorID
       }
-      const created = await ctx.session.create({ title: options.title, location: { directory: options.home } })
-      await pin(created.id)
-      return created.id
+      return repin(orchestratorID)
     }
 
     /**
@@ -579,7 +622,12 @@ export default Plugin.define({
         for await (const event of ctx.event.subscribe({ types: [...EVENT_TYPES], signal: controller.signal })) {
           if (event.type === "session.deleted") {
             const data = event.data as { sessionID?: string }
-            if (data.sessionID && registry[data.sessionID]) void sweep()
+            if (data.sessionID && data.sessionID === orchestratorID) {
+              const previous = data.sessionID
+              void enqueue(async () => {
+                if (orchestratorID === previous) await repin(previous)
+              }).catch((error) => console.warn(`[${ID}]`, "failed to re-pin orchestrator", error))
+            } else if (data.sessionID && registry[data.sessionID]) void sweep()
             continue
           }
           const transition = transitionFor(event)

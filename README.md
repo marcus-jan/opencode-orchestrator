@@ -35,6 +35,7 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
 - The board is attached to the orchestrator as a context entry. It refreshes on every change and costs no extra turns.
 - When a worker is `done`, `failed`, or `blocked`, the plugin queues a short synthetic note in the orchestrator without starting a turn.
 - `/orchestrator` pins the current session as the orchestrator instead and prints the `scrawl send` command for it.
+- If the orchestrator session is deleted, the plugin re-pins the most recently used other session in `home` (not a worker), or creates a new one, and posts a catch-up there with any alerts it could not deliver.
 
 Only the plugin instance whose location matches `home` is active. That way, installing the plugin globally doesn't create duplicate trackers.
 
@@ -44,7 +45,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.2", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.1.3", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```

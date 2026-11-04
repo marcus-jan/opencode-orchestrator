@@ -1,6 +1,6 @@
 {
   "name": "opencode-orchestrator",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pinned OpenCode orchestrator session that spawns worker sessions and tracks their status",
   "type": "module",
   "license": "MIT",
