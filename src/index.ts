@@ -144,6 +144,27 @@ const requestJoin = (ctx: Plugin.Context) => async ({ sessionID, prompt }: { ses
   })
 }
 
+/** Session metadata key /close-worker sets; the home instance closes the worker when it sees it. */
+export const CLOSE_KEY = "orchestratorClose"
+
+const CLOSE_COMMAND = {
+  name: "close-worker",
+  description: "Close this worker: remove its worktree and herdr space (add: branch, session, force)",
+}
+
+const requestClose = (ctx: Plugin.Context) => async ({ sessionID, prompt }: { sessionID: string; prompt?: { text?: string } }) => {
+  const info = await ctx.session.get({ sessionID })
+  const words = new Set((prompt?.text ?? "").toLowerCase().split(/[\s,]+/).filter(Boolean))
+  const request = { branch: words.has("branch"), session: words.has("session"), force: words.has("force"), at: Date.now() }
+  await ctx.session.update({ sessionID, metadata: { ...(info.metadata ?? {}), [CLOSE_KEY]: request } })
+  const extras = [request.branch && "delete its branch", request.session && "delete this session", request.force && "discard uncommitted changes"]
+  await ctx.session.synthetic({
+    sessionID,
+    text: `Asked the orchestrator to close this worker: remove its worktree and herdr space${extras.some(Boolean) ? `, ${extras.filter(Boolean).join(", ")}` : ""}. This space closes when it's done.`,
+    resume: false,
+  })
+}
+
 export default Plugin.define({
   id: ID,
   async setup(ctx) {
@@ -155,7 +176,10 @@ export default Plugin.define({
       const idle = await ctx.rpc.register(Orchestrator, {
         snapshot: async () => ({ home: options.home, workers: [] }) satisfies Snapshot,
       })
-      await ctx.command.transform((editor) => editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) }))
+      await ctx.command.transform((editor) => {
+        editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) })
+        editor.add({ ...CLOSE_COMMAND, execute: requestClose(ctx) })
+      })
       return () => void idle.dispose()
     }
 
@@ -469,6 +493,7 @@ export default Plugin.define({
 
     await ctx.command.transform((editor) => {
       editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) })
+      editor.add({ ...CLOSE_COMMAND, execute: requestClose(ctx) })
       editor.add({
         name: "attach",
         description: "Track an existing session as a worker: session id, herdr space (w4K) or title words",
@@ -548,8 +573,27 @@ export default Plugin.define({
           kept.length && `Not done: ${kept.join("; ")}. Pass force: true only if the user confirms discarding it.`,
           left.length && `Still left: ${left.join("; ")}.`,
         ]
-        return { content: lines.filter(Boolean).join("\n") }
+        return { content: lines.filter(Boolean).join("\n"), failed: kept.length > 0 }
       })
+    }
+
+    /** /close-worker from inside a worker: close it, then report to the orchestrator (and to the worker if anything failed). */
+    const closeFromWorker = async (sessionID: string, request: Record<string, unknown>) => {
+      const worker = registry[sessionID]
+      const reply = (text: string) =>
+        ctx.session.synthetic({ sessionID, text, description: "Close worker", resume: false }).catch(() => undefined)
+      if (!worker) return void (await reply("This session is not tracked by the orchestrator. Run /join-orchestrator first, or close it by hand."))
+      if (isClosed(worker) || closing.has(sessionID)) return void (await reply("The orchestrator has already closed this worker."))
+      closing.add(sessionID)
+      try {
+        const result = await closeWorker(worker, request)
+        await tell(`${result.content}\n(Closed from the worker with /close-worker.)`, "Worker closed", false)
+        if (result.failed) {
+          await reply(`${result.content}\nCommit or stash your changes and run /close-worker again, or run /close-worker force to discard them.`)
+        }
+      } finally {
+        closing.delete(sessionID)
+      }
     }
 
     await ctx.tool.transform((editor) => {
@@ -745,7 +789,7 @@ export default Plugin.define({
           if (!worker) throw new Error(`${sessionID} is not a tracked worker`)
           closing.add(sessionID)
           try {
-            return await closeWorker(worker, input)
+            return { content: (await closeWorker(worker, input)).content }
           } finally {
             closing.delete(sessionID)
           }
@@ -828,6 +872,17 @@ export default Plugin.define({
           if (event.type === "session.metadata.updated") {
             const data = event.data as { sessionID?: string; metadata?: Record<string, unknown> }
             const join = data.metadata?.[JOIN_KEY] as { why?: string | null } | null | undefined
+            const close = data.metadata?.[CLOSE_KEY] as Record<string, unknown> | null | undefined
+            if (data.sessionID && close && typeof close === "object") {
+              const sessionID = data.sessionID
+              await ctx.session
+                .update({ sessionID, metadata: { ...data.metadata, [CLOSE_KEY]: null } as never })
+                .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear close request", error))
+              void closeFromWorker(sessionID, close).catch((error: unknown) =>
+                console.warn(`[${ID}]`, `failed to close ${sessionID}`, error),
+              )
+              continue
+            }
             if (!data.sessionID || !join || typeof join !== "object") continue
             const sessionID = data.sessionID
             // Clear the request first so later metadata updates don't re-attach a worker the user forgot.

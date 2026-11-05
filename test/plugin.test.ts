@@ -201,7 +201,7 @@ test("stays inactive outside its home directory", async () => {
   const { ctx, tools, commands, calls, rpcHandlers } = fakeContext("/elsewhere", { home })
   await plugin.setup(ctx as never)
   expect(tools.size).toBe(0)
-  expect([...commands.keys()]).toEqual(["join-orchestrator"])
+  expect([...commands.keys()]).toEqual(["join-orchestrator", "close-worker"])
   expect(calls).toEqual([])
   // Points sidebars on sessions elsewhere at the orchestrator's home.
   expect(await rpcHandlers.snapshot({})).toEqual({ home, workers: [] })
@@ -604,5 +604,42 @@ test("/join-orchestrator in another session flags it and the orchestrator adopts
   await settle()
   expect(calls.filter((c) => c.method === "synthetic" && c.input.text.startsWith("Attached"))).toHaveLength(1)
   expect((await tools.get("list_workers").execute({})).content).toContain("[attached]")
+  await cleanup()
+})
+
+test("/close-worker in a worker flags it and the orchestrator closes it", async () => {
+  const away = fakeContext("/elsewhere", { home })
+  await plugin.setup(away.ctx as never)
+  await away.commands.get("close-worker").execute({ sessionID: "ses_2", prompt: { text: "branch" } })
+  const flagged = away.calls.find((c) => c.method === "update")?.input
+  expect(flagged.metadata.orchestratorClose).toEqual({ branch: true, session: false, force: false, at: expect.any(Number) })
+
+  const shell = fakeShell()
+  const { tools, calls, emit, cleanup } = await started()
+  await spawnLogin(tools)
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: flagged.metadata } })
+  await settle()
+  expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_2")?.input.metadata.orchestratorClose).toBeNull()
+  expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
+  const note = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_1" && c.input.text.includes("/close-worker"))
+  expect(note?.input.text).toContain("deleted branch fix/ABC-1-login")
+  expect(note?.input.resume).toBe(false)
+  expect(calls.filter((c) => c.method === "synthetic" && c.input.sessionID === "ses_2")).toHaveLength(0)
+
+  // The cleared flag echoes back; nothing closes twice.
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: { orchestratorClose: null } } })
+  await settle()
+  expect(calls.filter((c) => c.method === "synthetic" && c.input.text.includes("/close-worker"))).toHaveLength(1)
+  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Fix Login")
+  await cleanup()
+})
+
+test("/close-worker in an untracked session says so", async () => {
+  fakeShell()
+  const { calls, emit, cleanup } = await started()
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_x", metadata: { orchestratorClose: { at: 1 } } } })
+  await settle()
+  const reply = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_x")
+  expect(reply?.input.text).toContain("not tracked")
   await cleanup()
 })

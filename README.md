@@ -32,6 +32,7 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
   - `attach_worker` starts tracking a session the orchestrator didn't spawn. Find it by session id, herdr space id or label (e.g. `w4K`), or words from its title. The repo, branch, worktree and herdr space are read from the session's folder and pane. Nothing new is created. If several sessions match, the orchestrator asks which one. `/attach <query>` does the same from the orchestrator's prompt.
   - `forget_worker` stops tracking a worker
 - `/join-orchestrator [why]`, run inside any other session, asks the orchestrator to track that session. It works from any folder. The orchestrator gets a one-line note when the session is attached.
+- `/close-worker [branch] [session] [force]`, run inside a worker, closes it the same way `close_worker` does: removes its worktree and herdr space, and with the extra words also deletes its branch, deletes the session, or discards uncommitted changes. The orchestrator gets a note. If something can't be removed (uncommitted changes, unmerged branch), the worker is told what to do instead.
 - Attached workers get the same `orchestrator-origin` context entry, status alerts, close detection, `close_worker` cleanup and sidebar row as spawned ones. A session in a repo's main checkout is never linked to the repo's own herdr space, so `close_worker` can't close that space.
 - In the TUI, the orchestrator session's sidebar lists its open workers: a status marker, title, state, herdr space and age. Workers that need attention come first. Click a worker to open its session.
 - A worker's own sidebar shows that it belongs to the orchestrator: "Orchestrator · worker" for spawned sessions, "Orchestrator · joined" for attached ones, with its current state. Click it to open the orchestrator. Untracked or closed sessions show nothing.
@@ -50,7 +51,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.1", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.2", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```
