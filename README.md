@@ -39,7 +39,9 @@ Built to be the fixed destination for Scrawl/Hex captures: send a recording to t
 - The plugin watches server events and tracks each worker as `queued → running → done | failed | interrupted`. A worker waiting on a permission prompt or a question shows as `blocked`.
 - Every `sweepSeconds` (and on `list_workers` or a deleted session) the plugin checks each worker's herdr space, worktree and session. If you closed any of them yourself, the worker becomes `closed` with a "closed manually" note. If something is left (an open space, a worktree on disk, the branch), the orchestrator is woken to ask whether to clean it up; otherwise it only gets a one-line note.
 - The board is attached to the orchestrator as a context entry. It refreshes on every change and costs no extra turns.
-- When a worker is `done`, `failed`, or `blocked`, the plugin queues a short synthetic note in the orchestrator without starting a turn.
+- Worker updates are batched: one line per worker (latest wins) is prepended to your next message to the orchestrator as `[Worker updates]`. Nothing is pushed into the orchestrator between turns, except a wake-up when a closed worker left something to clean up.
+- With the default `notify: "attention"`, a worker shows up there when it fails or blocks, or when a turn the orchestrator started (`spawn_worker`, `message_worker`) ends. Turns you start yourself inside a worker stay quiet. A block that clears before you read it is dropped. `done` means the worker went idle, not that one step inside a turn finished.
+- Done lines include the worker's own one-line summary: workers are asked to end with `Outcome: ...`, otherwise the first line of their last reply is used (160 chars max).
 - `/orchestrator` pins the current session as the orchestrator instead and prints the `scrawl send` command for it.
 - If the orchestrator session is deleted, the plugin re-pins the most recently used other session in `home` (not a worker), or creates a new one, and posts a catch-up there with any alerts it could not deliver.
 
@@ -51,7 +53,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 // ~/.config/opencode/opencode.jsonc
 {
   "plugins": [
-    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.2", "options": { "home": "/path/to/your/repos" } }
+    { "package": "github:marcus-jan/opencode-orchestrator#v0.2.3", "options": { "home": "/path/to/your/repos" } }
   ]
 }
 ```
@@ -60,7 +62,7 @@ Only the plugin instance whose location matches `home` is active. That way, inst
 | -------- | ------------------------ | ---------------------------------------------------- |
 | `home`   | the plugin's location    | Directory the orchestrator session lives in          |
 | `title`  | `"Orchestrator"`         | Title for the orchestrator session                   |
-| `notify` | `true`                   | Queue a note when a worker is done, failed, or blocked |
+| `notify` | `"attention"`            | `"attention"`: failures, blocks, and ends of orchestrator-started turns. `"all"`: every finished turn too. `"off"`: nothing (the board and sidebar still update). `true`/`false` map to `"attention"`/`"off"` |
 | `worktree` | `true`                 | Default to a fresh worktree for workers in a git project |
 | `herdr`  | `$HERDR_BIN_PATH` or `~/.local/bin/herdr` | Herdr binary used to open worker spaces; `false` keeps workers headless |
 | `model`  | the spawning session's model | Worker model as `providerID/modelID`. If it isn't available, workers use the spawning session's model (noted in the spawn result); with neither, the spawn fails instead of using OpenCode's free models |

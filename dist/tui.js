@@ -36,7 +36,7 @@ var Orchestrator = Rpc.define({
 });
 
 // src/registry.ts
-var NOTIFY_STATES = new Set(["done", "failed", "blocked"]);
+var ATTENTION_STATES = new Set(["failed", "blocked"]);
 function formatAge(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60)

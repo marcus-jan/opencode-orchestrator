@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { runtime } from "../src/herdr"
-import plugin, { parseOptions } from "../src/index"
+import plugin, { parseOptions, summarize } from "../src/index"
 import type { WorkerState } from "../src/registry"
 import type { Snapshot } from "../src/rpc"
 import { membership, view } from "../src/sidebar"
@@ -103,6 +103,15 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
   /** Extra SessionInfo fields for sessions the orchestrator did not create. */
   const infos = new Map<string, Record<string, unknown>>()
   const commands = new Map<string, any>()
+  /** Messages session.context returns per session. */
+  const replies = new Map<string, unknown[]>()
+  const hooks: Record<string, (input: any) => void> = {}
+  /** Runs the prompt hook the way OpenCode does before a user message is sent. */
+  const ask = async (sessionID: string, text: string) => {
+    const input = { sessionID, messageID: "msg", prompt: { text }, delivery: "queue" }
+    await hooks.prompt?.(input)
+    return input.prompt.text
+  }
   let next = 0
   let push: ((event: unknown) => void) | undefined
   const queue: unknown[] = []
@@ -136,6 +145,11 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
         data: sessions.filter((s) => !deleted.has(s.id) && (!input.search || String(infos.get(s.id)?.title ?? "").includes(input.search))),
       })),
       instructions: { entry: { put: record("board") } },
+      context: async (input: any) => replies.get(input.sessionID) ?? [],
+      hook: async (name: string, callback: (input: any) => void) => {
+        hooks[name] = callback
+        return { dispose: async () => {} }
+      },
     },
     model: {
       list: async () => ({ data: [{ id: "opus", modelID: "opus", providerID: "anthropic" }] }),
@@ -171,7 +185,7 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       }),
     },
   }
-  return { ctx, tools, commands, calls, store, deleted, sessions, infos, rpcHandlers, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
+  return { ctx, tools, commands, calls, store, deleted, sessions, infos, rpcHandlers, replies, ask, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
@@ -186,9 +200,12 @@ async function started(options: Record<string, unknown> = {}) {
 const created = (calls: { method: string; input: any }[]) => calls.filter((c) => c.method === "create").slice(1)
 
 test("parseOptions resolves defaults and validates types", () => {
-  expect(parseOptions(undefined, "/home")).toMatchObject({ home: "/home", title: "Orchestrator", notify: true, worktree: true })
+  expect(parseOptions(undefined, "/home")).toMatchObject({ home: "/home", title: "Orchestrator", notify: "attention", worktree: true })
+  expect(parseOptions({ notify: true }, "/home").notify).toBe("attention")
+  expect(parseOptions({ notify: false }, "/home").notify).toBe("off")
+  expect(parseOptions({ notify: "all" }, "/home").notify).toBe("all")
   expect(parseOptions({ herdr: false }, "/home").herdr).toBe(false)
-  expect(() => parseOptions({ notify: "yes" }, "/home")).toThrow('option "notify" must be a boolean')
+  expect(() => parseOptions({ notify: "yes" }, "/home")).toThrow('option "notify" must be')
   expect(() => parseOptions({ herdr: 1 }, "/home")).toThrow('option "herdr" must be a string or false')
   expect(parseOptions({ model: "claude-local/claude-opus-5-5" }, "/home").model).toEqual({
     providerID: "claude-local",
@@ -218,7 +235,7 @@ test("lists git projects and tells the orchestrator how to name workers", async 
 
 test("opens project workers as a herdr worktree space nested under the repo", async () => {
   const runs = fakeShell()
-  const { tools, calls, emit, cleanup } = await started()
+  const { tools, calls, emit, replies, ask, cleanup } = await started()
   expect(calls.find((c) => c.method === "create")?.input.title).toBe("Orchestrator")
 
   const result = await tools.get("spawn_worker").execute({
@@ -248,19 +265,77 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   expect(pinned).toContain("Herdr space: w10")
   expect(calls.findIndex((c) => c.input?.key === "orchestrator-origin")).toBeLessThan(calls.findIndex((c) => c.method === "prompt"))
 
+  replies.set("ses_2", [
+    { type: "assistant", content: [{ type: "text", text: "## Done\nFixed the redirect.\n\n**Outcome:** login fixed, PR #12 open" }] },
+  ])
   emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_2" } })
-  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_unrelated" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_unrelated" } })
   await settle()
 
-  const notes = calls.filter((c) => c.method === "synthetic")
-  expect(notes).toHaveLength(1)
-  expect(notes[0].input.sessionID).toBe("ses_1")
-  expect(notes[0].input.text).toContain("is now done")
-  expect((await tools.get("list_workers").execute({})).content).toContain(
-    `[done] Fix Login — ses_2 — ${worktree} [worktree fix/ABC-1-login] [herdr w10]`,
-  )
+  // Alerts are batched into the orchestrator's next prompt, not streamed as messages.
+  expect(calls.filter((c) => c.method === "synthetic")).toHaveLength(0)
+  expect(await ask("ses_2", "hi")).toBe("hi")
+  expect(await ask("ses_1", "next")).toBe("[Worker updates]\n- Fix Login ses_2: done — login fixed, PR #12 open\n\nnext")
+  expect(await ask("ses_1", "again")).toBe("again")
+  expect((await tools.get("list_workers").execute({})).content).toContain("- done: Fix Login ses_2 w10")
+
+  // A turn the user starts in the worker's own space ends without an alert.
+  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  await settle()
+  expect(await ask("ses_1", "quiet")).toBe("quiet")
+
+  // A follow-up from the orchestrator makes the next finish worth an alert again.
+  await tools.get("message_worker").execute({ sessionID: "ses_2", text: "also check logout" })
+  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  await settle()
+  expect(await ask("ses_1", "x")).toContain("- Fix Login ses_2: done")
   await cleanup()
+})
+
+test("failures and blocks always alert; a block cleared before the next prompt is dropped", async () => {
+  fakeShell()
+  const { tools, emit, ask, cleanup } = await started()
+  await tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
+  emit({ type: "permission.asked", data: { id: "p1", sessionID: "ses_2", action: "bash", resources: [] } })
+  emit({ type: "permission.replied", data: { sessionID: "ses_2", requestID: "p1", reply: "once" } })
+  await settle()
+  expect(await ask("ses_1", "a")).toBe("a")
+  emit({ type: "session.execution.failed", data: { sessionID: "ses_2", error: { message: "boom" } } })
+  await settle()
+  expect(await ask("ses_1", "b")).toBe("[Worker updates]\n- Fix Login ses_2: failed (boom)\n\nb")
+  await cleanup()
+})
+
+test("notify all alerts every finished turn and off stays silent", async () => {
+  fakeShell()
+  const all = await started({ notify: "all" })
+  await all.tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
+  all.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  await settle()
+  await all.ask("ses_1", "a")
+  all.emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
+  all.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  await settle()
+  expect(await all.ask("ses_1", "b")).toContain("Fix Login ses_2: done")
+  await all.cleanup()
+
+  fakeShell()
+  const off = await started({ notify: "off" })
+  await off.tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
+  off.emit({ type: "session.execution.failed", data: { sessionID: "ses_2", error: { message: "boom" } } })
+  await settle()
+  expect(await off.ask("ses_1", "b")).toBe("b")
+  await off.cleanup()
+})
+
+test("summarize picks the Outcome line and keeps it short", () => {
+  expect(summarize("Intro\n\n- **Outcome:** shipped `x`")).toBe("shipped x")
+  expect(summarize("\n# Title here\nmore")).toBe("Title here")
+  expect(summarize("a".repeat(200))?.length).toBe(160)
+  expect(summarize("  \n ")).toBeUndefined()
 })
 
 test("serves the sidebar a snapshot and signals each worker change", async () => {
@@ -427,8 +502,7 @@ test("asks about leftovers when the user closes a worker's herdr space and workt
   shell.spaces.delete("w10")
 
   const listed = (await tools.get("list_workers").execute({})).content
-  expect(listed).toContain("[closed] Fix Login")
-  expect(listed).toContain("closed manually: herdr space w10 closed, worktree removed; left: branch fix/ABC-1-login (not on origin)")
+  expect(listed).toContain("closed, left branch fix/ABC-1-login (not on origin): Fix Login ses_2")
   const [note] = closedNotes(calls)
   expect(note.resume).toBe(true)
   expect(note.text).toContain("Still left: branch fix/ABC-1-login (not on origin)")
@@ -459,13 +533,12 @@ test("a deleted session with its worktree still around asks about the worktree",
 
 test("records a closed idea space with nothing left without waking the orchestrator", async () => {
   const shell = fakeShell()
-  const { tools, calls, cleanup } = await started()
+  const { tools, calls, ask, cleanup } = await started()
   await tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
   shell.spaces.delete("w10")
   await tools.get("list_workers").execute({})
-  const [note] = closedNotes(calls)
-  expect(note.text).toBe('Worker "Idea" (ses_2) was closed manually: herdr space w10 closed; nothing left to clean up.')
-  expect(note.resume).toBe(false)
+  expect(closedNotes(calls)).toHaveLength(0)
+  expect(await ask("ses_1", "x")).toContain('Worker "Idea" (ses_2) was closed manually: herdr space w10 closed; nothing left to clean up.')
   await cleanup()
 })
 
@@ -479,8 +552,7 @@ test("close_worker removes the worktree and space without reporting a manual clo
   )
   expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
   expect(shell.spaces.has("w10")).toBe(false)
-  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Fix Login")
-  expect((await tools.get("list_workers").execute({})).content).toContain("closed by orchestrator")
+  expect((await tools.get("list_workers").execute({})).content).toContain("closed, left branch fix/ABC-1-login (not on origin): Fix Login ses_2")
   expect(closedNotes(calls)).toHaveLength(0)
   await cleanup()
 })
@@ -500,16 +572,17 @@ test("re-pins the most recent other session when the orchestrator is deleted", a
   await cleanup()
 })
 
-test("replays alerts that could not reach a deleted orchestrator", async () => {
+test("keeps pending updates for the next orchestrator after a re-pin", async () => {
   fakeShell()
-  const { tools, calls, deleted, emit, store, cleanup } = await started()
+  const { tools, deleted, emit, store, ask, cleanup } = await started()
   await tools.get("spawn_worker").execute({ title: "Idea", prompt: "think", why: "dictation" })
   deleted.add("ses_1")
-  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_2" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+  await settle()
+  emit({ type: "session.deleted", data: { sessionID: "ses_1" } })
   await settle()
   expect(store.get("orchestrator")).toBe("ses_3")
-  const catchUp = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_3")
-  expect(catchUp?.input.text).toContain('Missed while there was no orchestrator:\n- Worker "Idea" (ses_2) is now done.')
+  expect(await ask("ses_3", "hi")).toContain("Idea ses_2: done")
   await cleanup()
 })
 
@@ -527,7 +600,7 @@ function externalWorker(shell: ReturnType<typeof fakeShell>, infos: Map<string, 
 
 test("attaches an existing session by its herdr space and tracks it like a spawned worker", async () => {
   const shell = fakeShell()
-  const { tools, calls, infos, emit, cleanup } = await started()
+  const { tools, calls, infos, emit, ask, cleanup } = await started()
   const tree = externalWorker(shell, infos)
 
   const result = await tools.get("attach_worker").execute({ session: "w20" })
@@ -539,17 +612,17 @@ test("attaches an existing session by its herdr space and tracks it like a spawn
   expect(calls.some((c) => c.method === "create" && c.input.title !== "Orchestrator")).toBe(false)
   expect((await tools.get("attach_worker").execute({ session: "ses_ext" })).content).toContain("already tracked")
 
-  emit({ type: "session.execution.succeeded", data: { sessionID: "ses_ext" } })
+  emit({ type: "session.idle", data: { sessionID: "ses_ext" } })
   await settle()
-  expect(calls.find((c) => c.method === "synthetic" && c.input.text.includes("is now done"))).toBeDefined()
-  const listed = (await tools.get("list_workers").execute({})).content
-  expect(listed).toContain("[done] Contentstack metrics — ses_ext")
-  expect(listed).toContain("[herdr w20]")
-  expect(listed).toContain("[attached]")
+  // The orchestrator did not start this turn, so its end is not worth an alert.
+  expect(await ask("ses_1", "x")).toBe("x")
+  expect((await tools.get("list_workers").execute({})).content).toContain("done: Contentstack metrics ses_ext w20")
 
   // Closing the space by hand is detected like any other worker.
   shell.spaces.delete("w20")
-  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Contentstack metrics")
+  const closed = (await tools.get("list_workers").execute({})).content
+  expect(closed).toContain("closed, left")
+  expect(closed).toContain("Contentstack metrics ses_ext")
   await cleanup()
 })
 
@@ -589,21 +662,20 @@ test("/join-orchestrator in another session flags it and the orchestrator adopts
   expect(flagged.metadata.orchestratorJoin).toEqual({ why: "finish the PR", at: expect.any(Number) })
 
   const shell = fakeShell()
-  const { tools, calls, infos, emit, cleanup } = await started()
+  const { tools, calls, infos, emit, ask, cleanup } = await started()
   externalWorker(shell, infos)
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: flagged.metadata } })
   await settle()
   expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_ext")?.input.metadata.orchestratorJoin).toBeNull()
-  const note = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_1" && c.input.text.startsWith("Attached"))
-  expect(note?.input.resume).toBe(false)
+  expect(await ask("ses_1", "x")).toStartWith("[Worker updates]\n- Attached")
   const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_ext")?.input.value
   expect(pinned).toContain("Why: finish the PR")
 
   // The cleared flag echoes back as another metadata update; it must not attach again.
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: { orchestratorJoin: null } } })
   await settle()
-  expect(calls.filter((c) => c.method === "synthetic" && c.input.text.startsWith("Attached"))).toHaveLength(1)
-  expect((await tools.get("list_workers").execute({})).content).toContain("[attached]")
+  expect(await ask("ses_1", "y")).toBe("y")
+  expect((await tools.get("list_workers").execute({})).content).toContain("ses_ext")
   await cleanup()
 })
 
@@ -615,22 +687,22 @@ test("/close-worker in a worker flags it and the orchestrator closes it", async 
   expect(flagged.metadata.orchestratorClose).toEqual({ branch: true, session: false, force: false, at: expect.any(Number) })
 
   const shell = fakeShell()
-  const { tools, calls, emit, cleanup } = await started()
+  const { tools, calls, emit, ask, cleanup } = await started()
   await spawnLogin(tools)
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: flagged.metadata } })
   await settle()
   expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_2")?.input.metadata.orchestratorClose).toBeNull()
   expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
-  const note = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_1" && c.input.text.includes("/close-worker"))
-  expect(note?.input.text).toContain("deleted branch fix/ABC-1-login")
-  expect(note?.input.resume).toBe(false)
+  const note = await ask("ses_1", "x")
+  expect(note).toContain("deleted branch fix/ABC-1-login")
+  expect(note).toContain("/close-worker")
   expect(calls.filter((c) => c.method === "synthetic" && c.input.sessionID === "ses_2")).toHaveLength(0)
 
   // The cleared flag echoes back; nothing closes twice.
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: { orchestratorClose: null } } })
   await settle()
-  expect(calls.filter((c) => c.method === "synthetic" && c.input.text.includes("/close-worker"))).toHaveLength(1)
-  expect((await tools.get("list_workers").execute({})).content).toContain("[closed] Fix Login")
+  expect(await ask("ses_1", "y")).toBe("y")
+  expect((await tools.get("list_workers").execute({})).content).toContain("1 closed")
   await cleanup()
 })
 

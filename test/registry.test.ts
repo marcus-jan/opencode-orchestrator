@@ -8,7 +8,7 @@ const worker = (state: Registry[string]["state"] = "queued"): Registry => ({
 describe("transitionFor", () => {
   test("maps execution lifecycle", () => {
     expect(transitionFor({ type: "session.execution.started", data: { sessionID: "s" } })?.state).toBe("running")
-    expect(transitionFor({ type: "session.execution.succeeded", data: { sessionID: "s" } })?.state).toBe("done")
+    expect(transitionFor({ type: "session.idle", data: { sessionID: "s" } })?.state).toBe("done")
     expect(transitionFor({ type: "session.execution.failed", data: { sessionID: "s", error: { message: "boom" } } })).toEqual({
       sessionID: "s",
       state: "failed",
@@ -53,5 +53,5 @@ describe("apply", () => {
 
 test("board renders workers", () => {
   expect(board({})).toBe("No workers yet.")
-  expect(board(worker("blocked"), 90_000)).toBe("- [blocked] Fix login — ses_a — /repo — 2m ago")
+  expect(board(worker("blocked"))).toBe("- blocked: Fix login ses_a")
 })

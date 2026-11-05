@@ -22,7 +22,7 @@ import {
   EVENT_TYPES,
   isClosed,
   leftovers,
-  NOTIFY_STATES,
+  ATTENTION_STATES,
   transitionFor,
   type Presence,
   type Registry,
@@ -36,14 +36,33 @@ const ORCHESTRATOR_KEY = "orchestrator"
 const WORKERS_KEY = "workers"
 const BOARD_KEY = "orchestrator-workers"
 const ORIGIN_KEY = "orchestrator-origin"
+const PENDING_KEY = "pending"
+
+/** One line from a worker's final message: its `Outcome:` line if present, else the first line. */
+export function summarize(text: string, max = 160) {
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean)
+  const marked = lines.find((line) => /^[*_#>\s-]*outcome:/i.test(line))
+  const line = (marked ?? lines[0] ?? "")
+    .replace(/^[#>\s*_-]*(outcome:)?/i, "")
+    .replace(/[*_`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!line) return undefined
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line
+}
+
+export type Notify = "attention" | "all" | "off"
 
 export interface Options {
   /** Directory the orchestrator lives in. Only the plugin instance for this location is active. */
   home: string
   /** Title applied to the pinned orchestrator session. */
   title: string
-  /** Post a synthetic message to the orchestrator when a worker finishes, fails, or blocks. */
-  notify: boolean
+  /**
+   * Which worker updates reach the orchestrator, batched into its next prompt:
+   * "attention" (failed, blocked, and turns the orchestrator started finishing), "all", or "off".
+   */
+  notify: Notify
   /** Give workers spawned inside a git project their own worktree unless the call says otherwise. */
   worktree: boolean
   /** Herdr binary used to open every worker in its own space, or false to keep workers headless. */
@@ -69,11 +88,15 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
   const model = pick<string | undefined>("model", "string", undefined)
   const slash = model?.indexOf("/") ?? -1
   if (model !== undefined && slash < 1) throw new Error(`${ID}: option "model" must look like "providerID/modelID"`)
+  const rawNotify = options.notify
+  const notify: Notify | undefined =
+    rawNotify === undefined || rawNotify === true ? "attention" : rawNotify === false ? "off" : (["attention", "all", "off"] as const).find((n) => n === rawNotify)
+  if (!notify) throw new Error(`${ID}: option "notify" must be "attention", "all" or "off"`)
   return {
     model: model ? { providerID: model.slice(0, slash), id: model.slice(slash + 1) } : undefined,
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
-    notify: pick("notify", "boolean", true),
+    notify,
     worktree: pick("worktree", "boolean", true),
     herdr: (options.herdr as string | false | undefined) ?? defaultHerdr,
     sweepSeconds: pick("sweepSeconds", "number", 60),
@@ -85,7 +108,7 @@ const notFound = (error: unknown) => {
   return /not ?found/i.test(`${e?._tag} ${e?.message} ${String(error)}`)
 }
 
-const NAMING = `Naming (you decide; never ask): give each worker a short friendly "title" (it becomes the herdr space label and session title) and, for repo work, a "branch" that follows the repo's convention: feat/, fix/, chore/, docs/ or hotfix/ prefix, Jira keys kept uppercase, e.g. feat/ABC-123-short-description. Worktrees branch off develop (master for hotfix/ branches) unless you pass "base". Ideas not tied to a repo: omit "project"; they get a new space in the orchestrator's folder. Always pass "why": the source of the request and the outcome the user wants.`
+const NAMING = `spawn_worker: you pick a short "title" and, for repo work, a "branch" (feat/ fix/ chore/ docs/ hotfix/, Jira key uppercase, e.g. feat/ABC-123-short-name; base develop, master for hotfix/). No repo: omit "project". Always pass "why". Keep worker prompts and your replies brief; worker updates arrive batched in the user's next message.`
 
 export interface Origin {
   orchestrator?: string
@@ -112,7 +135,7 @@ export function origin(o: Origin): string {
     o.branch && `Branch: ${o.branch}${o.base ? ` off ${o.base}` : ""}`,
     `Working directory: ${o.directory}`,
     o.space && `Herdr space: ${o.space}`,
-    "The orchestrator only tracks your status (running, blocked, done, failed). Finish by summarizing what you did and what is left.",
+    "The orchestrator only tracks your status. End your final message with one line: `Outcome: <what you did and what is left>`.",
   ]
     .filter(Boolean)
     .join("\n")
@@ -186,6 +209,7 @@ export default Plugin.define({
     const controller = new AbortController()
     let registry = ((await ctx.storage.get(WORKERS_KEY)) ?? {}) as unknown as Registry
     let orchestratorID = (await ctx.storage.get(ORCHESTRATOR_KEY)) as string | undefined
+    let pending = ((await ctx.storage.get(PENDING_KEY)) ?? {}) as Record<string, string>
 
     let chain = Promise.resolve()
     const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
@@ -219,6 +243,7 @@ export default Plugin.define({
     const changed = () =>
       rpc.events.emit("changed", {}).catch((error: unknown) => console.warn(`[${ID}]`, "failed to emit change", error))
 
+    const published = new Map<string, string>()
     const publish = async () => {
       void changed()
       if (!orchestratorID) return
@@ -227,8 +252,11 @@ export default Plugin.define({
         `Git projects under ${options.home} (spawn_worker "project"): ${projects.join(", ") || "none"}`,
         `Workers in a project get their own worktree by default: ${options.worktree ? "yes" : "no"}`,
         NAMING,
-        `Worker sessions you spawned:\n${board(registry)}`,
+        `Workers:\n${board(registry)}`,
       ].join("\n\n")
+      // Every change re-sends the whole block to the model, so skip identical boards.
+      if (value === published.get(orchestratorID)) return
+      published.set(orchestratorID, value)
       await ctx.session.instructions.entry
         .put({ sessionID: orchestratorID, key: BOARD_KEY, value })
         .catch((error: unknown) => console.warn(`[${ID}]`, "failed to publish board", error))
@@ -277,8 +305,14 @@ export default Plugin.define({
     }
 
     /** Posts an alert to the orchestrator, re-pinning first if its session was deleted. */
-    const tell = async (text: string, description: string, resume: boolean) => {
-      if (!options.notify) return
+    const tell = async (text: string, description: string, resume: boolean, key?: string) => {
+      if (options.notify === "off") return
+      // Anything that doesn't need an answer now waits for the orchestrator's next prompt.
+      if (!resume) {
+        pending[key ?? `note:${Date.now()}`] = text
+        await ctx.storage.set(PENDING_KEY, pending as never)
+        return
+      }
       const sessionID = orchestratorID
       if (!sessionID) {
         missed.push({ text, resume })
@@ -295,8 +329,28 @@ export default Plugin.define({
     }
 
     const notify = async (worker: Worker) => {
-      const detail = worker.detail ? `: ${worker.detail}` : ""
-      await tell(`Worker "${worker.title}" (${worker.id}) is now ${worker.state}${detail}.`, `${worker.title} ${worker.state}`, false)
+      const detail = worker.detail ? ` (${worker.detail})` : ""
+      const result = worker.state === "done" ? await outcome(worker.id) : undefined
+      await tell(`${worker.title} ${worker.id}: ${worker.state}${detail}${result ? ` — ${result}` : ""}`, "", false, worker.id)
+    }
+
+    /** One line from the worker's last reply: its `Outcome:` line, else its first line. */
+    const outcome = async (sessionID: string) => {
+      const messages = await ctx.session.context({ sessionID }).catch(() => [])
+      const last = [...(messages as readonly { type?: string; content?: { type?: string; text?: string }[] }[])]
+        .reverse()
+        .find((m) => m.type === "assistant" && m.content?.some((c) => c.type === "text" && c.text?.trim()))
+      return summarize(last?.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n") ?? "")
+    }
+
+    /** Folds pending updates into the orchestrator's next prompt instead of one message per update. */
+    const flush = (input: { sessionID: string; prompt: { text?: string } }) => {
+      if (input.sessionID !== orchestratorID) return
+      const lines = Object.values(pending)
+      if (!lines.length) return
+      pending = {}
+      void ctx.storage.set(PENDING_KEY, {} as never)
+      input.prompt.text = `[Worker updates]\n${lines.map((l) => `- ${l}`).join("\n")}\n\n${input.prompt.text ?? ""}`
     }
 
     const mux = options.herdr ? herdr(options.herdr) : undefined
@@ -714,6 +768,7 @@ export default Plugin.define({
               space: space?.workspace,
               why,
               state: "queued",
+              asked: true,
               created: now,
               updated: now,
             }
@@ -813,6 +868,10 @@ export default Plugin.define({
           const input = raw as Record<string, unknown>
           const sessionID = str(input.sessionID, "sessionID")!
           if (!registry[sessionID]) throw new Error(`${sessionID} is not a tracked worker`)
+          await enqueue(async () => {
+            registry[sessionID].asked = true
+            await save()
+          })
           await ctx.session.prompt({
             sessionID,
             text: str(input.text, "text")!,
@@ -911,7 +970,20 @@ export default Plugin.define({
             if (!worker) return
             await save()
             await publish()
-            if (NOTIFY_STATES.has(worker.state)) await notify(worker)
+            const ended = worker.state === "done" || worker.state === "failed"
+            const asked = worker.asked
+            if (ended && asked) {
+              worker.asked = false
+              await save()
+            }
+            if (transition.unblock && pending[worker.id]) {
+              delete pending[worker.id]
+              await ctx.storage.set(PENDING_KEY, pending as never)
+            }
+            const wanted =
+              ATTENTION_STATES.has(worker.state) ||
+              (worker.state === "done" && (asked || options.notify === "all"))
+            if (wanted) await notify(worker)
           })
         }
       } catch (error) {
@@ -926,10 +998,13 @@ export default Plugin.define({
     void sweep()
     const timer = options.sweepSeconds > 0 ? setInterval(() => void sweep(), options.sweepSeconds * 1000) : undefined
 
+    const hook = await ctx.session.hook("prompt", (input) => flush(input as never))
+
     return () => {
       controller.abort()
       if (timer) clearInterval(timer)
       void rpc.dispose()
+      void hook.dispose()
     }
   },
 })

@@ -20,6 +20,8 @@ export interface Worker {
   why?: string
   /** Started outside the orchestrator and attached later. */
   attached?: boolean
+  /** The orchestrator started the current turn, so its end is worth an alert. */
+  asked?: boolean
   state: WorkerState
   detail?: string
   created: number
@@ -35,8 +37,8 @@ export interface Transition {
   unblock?: boolean
 }
 
-// States worth interrupting the orchestrator for. Everything else only updates the board.
-export const NOTIFY_STATES: ReadonlySet<WorkerState> = new Set(["done", "failed", "blocked"])
+// States that always need the user's attention. "done" only alerts for turns the orchestrator started.
+export const ATTENTION_STATES: ReadonlySet<WorkerState> = new Set(["failed", "blocked"])
 
 type AnyEvent = { type: string; data?: any }
 
@@ -45,7 +47,8 @@ export function transitionFor(event: AnyEvent): Transition | undefined {
   switch (event.type) {
     case "session.execution.started":
       return { sessionID: data.sessionID, state: "running" }
-    case "session.execution.succeeded":
+    // execution.succeeded fires for every run inside a turn; the turn only ends when the session goes idle.
+    case "session.idle":
       return { sessionID: data.sessionID, state: "done" }
     case "session.execution.failed":
       return { sessionID: data.sessionID, state: "failed", detail: data.error?.message }
@@ -99,7 +102,7 @@ export function closure(worker: Worker, p: Presence) {
 
 export const EVENT_TYPES = [
   "session.execution.started",
-  "session.execution.succeeded",
+  "session.idle",
   "session.execution.failed",
   "session.execution.interrupted",
   "permission.asked",
@@ -122,18 +125,19 @@ export function apply(registry: Registry, t: Transition, now = Date.now()): Work
   return next
 }
 
-export function board(registry: Registry, now = Date.now()) {
+/** Compact board for the orchestrator's context: open workers only, no paths or ages. */
+export function board(registry: Registry) {
   const workers = Object.values(registry).sort((a, b) => a.created - b.created)
-  if (workers.length === 0) return "No workers yet."
-  return workers
-    .map((w) => {
-      const age = formatAge(now - w.updated)
-      const notes = [w.detail, w.leftovers?.length && `left: ${w.leftovers.join(", ")}`].filter(Boolean)
-      const detail = notes.length ? ` (${notes.join("; ")})` : ""
-      const tree = (w.worktree ? ` [worktree ${w.worktree}]` : "") + (w.space ? ` [herdr ${w.space}]` : "") + (w.attached ? " [attached]" : "")
-      return `- [${w.state}] ${w.title} — ${w.id} — ${w.directory}${tree} — ${age} ago${detail}`
-    })
-    .join("\n")
+  const open = workers.filter((w) => !isClosed(w))
+  const lines = open.map((w) => {
+    const detail = w.detail ? ` (${w.detail})` : ""
+    const space = w.space ? ` ${w.space}` : ""
+    return `- ${w.state}: ${w.title} ${w.id}${space}${detail}`
+  })
+  const closed = workers.length - open.length
+  const left = workers.filter((w) => isClosed(w) && w.leftovers?.length).map((w) => `- closed, left ${w.leftovers!.join(", ")}: ${w.title} ${w.id}`)
+  if (!lines.length && !left.length) return closed ? `No open workers (${closed} closed).` : "No workers yet."
+  return [...lines, ...left, ...(closed > left.length ? [`(${closed - left.length} more closed)`] : [])].join("\n")
 }
 
 export function formatAge(ms: number) {
