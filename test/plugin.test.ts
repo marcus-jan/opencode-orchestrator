@@ -3,10 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { runtime } from "../src/herdr"
-import plugin, { parseOptions, summarize } from "../src/index"
-import type { WorkerState } from "../src/registry"
-import type { Snapshot } from "../src/rpc"
-import { membership, view } from "../src/sidebar"
+import plugin, { parseOptions } from "../src/index"
 
 const home = mkdtempSync(path.join(tmpdir(), "orchestrator-"))
 mkdirSync(path.join(home, "web", ".git"), { recursive: true })
@@ -28,11 +25,13 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
   const runs: string[][] = []
   const spaces = new Map<string, string | undefined>([["w1", undefined]])
   const branches = new Set(["feat/taken"])
-  /** Directories that are git checkouts, for attaching existing sessions. */
+  /** Branches pushed to origin, and checkouts with uncommitted changes. */
+  const pushed = new Set<string>()
+  const dirty = new Set<string>()
+  /** Directories that are git checkouts, for sessions that join. */
   const checkouts = new Map<string, { root: string; checkout: string; branch?: string }>()
   /** herdr pane running each OpenCode session, by space id. */
   const panes = new Map<string, string>()
-  const labels = new Map<string, string>()
   runtime.sleep = async () => {}
   const refs: Record<string, string[]> = { web: ["origin/develop", "origin/master"], api: ["main"] }
   let next = 9
@@ -46,6 +45,8 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
       if (args[2] === "rev-parse" && ref === "--git-common-dir") return checkout ? path.join(checkout.root, ".git") : Promise.reject(new Error("not a git repo"))
       if (args[2] === "branch" && ref === "--show-current") return checkout?.branch ?? ""
       if (args[2] === "fetch") return ""
+      if (args[2] === "status") return dirty.has(args[1]) ? " M file.ts\n" : ""
+      if (ref.startsWith("refs/remotes/origin/") && pushed.has(ref.slice(20))) return "ok"
       if (ref.startsWith("refs/heads/") && branches.has(ref.slice(11))) return "ok"
       if (args[2] === "worktree" && args[3] === "remove") return void rmSync(ref, { recursive: true, force: true }), ""
       if (args[2] === "branch" && branches.delete(ref)) return ""
@@ -63,7 +64,7 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     if (args[0] === "workspace" && args[1] === "list") {
       const main = { repo_root: path.join(home, "web"), is_linked_worktree: false }
       return json({
-        workspaces: [...spaces.keys()].map((id) => ({ workspace_id: id, label: labels.get(id) ?? id, ...(id === "w1" && { worktree: main }) })),
+        workspaces: [...spaces.keys()].map((id) => ({ workspace_id: id, label: id, ...(id === "w1" && { worktree: main }) })),
       })
     }
     if (args[0] === "pane" && args[1] === "list") {
@@ -91,7 +92,7 @@ function fakeShell({ herdr = true, busy = 0 } = {}) {
     }
     return json({})
   }
-  return Object.assign(runs, { spaces, branches, checkouts, panes, labels })
+  return Object.assign(runs, { spaces, branches, checkouts, panes, pushed, dirty })
 }
 
 function fakeContext(directory: string, options: Record<string, unknown> = {}) {
@@ -103,29 +104,20 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
   /** Extra SessionInfo fields for sessions the orchestrator did not create. */
   const infos = new Map<string, Record<string, unknown>>()
   const commands = new Map<string, any>()
-  /** Messages session.context returns per session. */
-  const replies = new Map<string, unknown[]>()
-  const hooks: Record<string, (input: any) => void> = {}
-  /** Runs the prompt hook the way OpenCode does before a user message is sent. */
-  const ask = async (sessionID: string, text: string) => {
-    const input = { sessionID, messageID: "msg", prompt: { text }, delivery: "queue" }
-    await hooks.prompt?.(input)
-    return input.prompt.text
-  }
   let next = 0
   let push: ((event: unknown) => void) | undefined
   const queue: unknown[] = []
-  const rpcHandlers: Record<string, (input: unknown) => Promise<unknown>> = {}
   const record = (method: string, result: (input: any) => unknown = () => ({})) => async (input: any) => {
     calls.push({ method, input })
     return result(input)
   }
   const ctx = {
-    options: { herdr: "/bin/herdr", sweepSeconds: 0, ...options },
+    options: { herdr: "/bin/herdr", ...options },
     location: { directory },
     storage: {
       get: async (key: string) => store.get(key),
       set: async (key: string, value: unknown) => void store.set(key, value),
+      remove: async (key: string) => void store.delete(key),
     },
     session: {
       create: record("create", () => ({ id: `ses_${++next}`, projectID: "prj_1" })),
@@ -145,23 +137,12 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
         data: sessions.filter((s) => !deleted.has(s.id) && (!input.search || String(infos.get(s.id)?.title ?? "").includes(input.search))),
       })),
       instructions: { entry: { put: record("board") } },
-      context: async (input: any) => replies.get(input.sessionID) ?? [],
-      hook: async (name: string, callback: (input: any) => void) => {
-        hooks[name] = callback
-        return { dispose: async () => {} }
-      },
     },
     model: {
       list: async () => ({ data: [{ id: "opus", modelID: "opus", providerID: "anthropic" }] }),
     },
     worktree: {
       create: record("worktree", (input) => ({ directory: path.join(home, ".worktrees", input.name) })),
-    },
-    rpc: {
-      register: async (_definition: unknown, handlers: Record<string, (input: unknown) => Promise<unknown>>) => {
-        rpcHandlers.snapshot = handlers.snapshot
-        return { events: { emit: record("changed") }, dispose: async () => {} }
-      },
     },
     command: {
       transform: async (fn: (editor: any) => void) => fn({ add: (command: any) => commands.set(command.name, command) }),
@@ -185,13 +166,14 @@ function fakeContext(directory: string, options: Record<string, unknown> = {}) {
       }),
     },
   }
-  return { ctx, tools, commands, calls, store, deleted, sessions, infos, rpcHandlers, replies, ask, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
+  return { ctx, tools, commands, calls, store, deleted, sessions, infos, emit: (event: unknown) => (push ? push(event) : queue.push(event)) }
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10))
 
-async function started(options: Record<string, unknown> = {}) {
+async function started(options: Record<string, unknown> = {}, stored: Record<string, unknown> = {}) {
   const fake = fakeContext(home, options)
+  for (const [key, value] of Object.entries(stored)) fake.store.set(key, value)
   const cleanup = await plugin.setup(fake.ctx as never)
   await settle()
   return { ...fake, cleanup: async () => void (cleanup && (await cleanup())) }
@@ -199,13 +181,16 @@ async function started(options: Record<string, unknown> = {}) {
 
 const created = (calls: { method: string; input: any }[]) => calls.filter((c) => c.method === "create").slice(1)
 
-test("parseOptions resolves defaults and validates types", () => {
-  expect(parseOptions(undefined, "/home")).toMatchObject({ home: "/home", title: "Orchestrator", notify: "attention", worktree: true })
-  expect(parseOptions({ notify: true }, "/home").notify).toBe("attention")
-  expect(parseOptions({ notify: false }, "/home").notify).toBe("off")
-  expect(parseOptions({ notify: "all" }, "/home").notify).toBe("all")
+test("parseOptions resolves defaults, validates types and ignores retired options", () => {
+  expect(parseOptions(undefined, "/home")).toEqual({
+    home: "/home",
+    title: "Orchestrator",
+    worktree: true,
+    herdr: expect.any(String),
+    model: undefined,
+  })
+  expect(parseOptions({ notify: "yes", sweepSeconds: "x" }, "/home")).not.toHaveProperty("notify")
   expect(parseOptions({ herdr: false }, "/home").herdr).toBe(false)
-  expect(() => parseOptions({ notify: "yes" }, "/home")).toThrow('option "notify" must be')
   expect(() => parseOptions({ herdr: 1 }, "/home")).toThrow('option "herdr" must be a string or false')
   expect(parseOptions({ model: "claude-local/claude-opus-5-5" }, "/home").model).toEqual({
     providerID: "claude-local",
@@ -215,30 +200,40 @@ test("parseOptions resolves defaults and validates types", () => {
 })
 
 test("stays inactive outside its home directory", async () => {
-  const { ctx, tools, commands, calls, rpcHandlers } = fakeContext("/elsewhere", { home })
+  const { ctx, tools, commands, calls } = fakeContext("/elsewhere", { home })
   await plugin.setup(ctx as never)
   expect(tools.size).toBe(0)
-  expect([...commands.keys()]).toEqual(["join-orchestrator", "close-worker"])
+  expect([...commands.keys()]).toEqual(["orchestrator-worker-join", "orchestrator-worker-close"])
   expect(calls).toEqual([])
-  // Points sidebars on sessions elsewhere at the orchestrator's home.
-  expect(await rpcHandlers.snapshot({})).toEqual({ home, workers: [] })
 })
 
 test("lists git projects and tells the orchestrator how to name workers", async () => {
-  const { tools, calls, cleanup } = await started()
-  expect((await tools.get("list_projects").execute({})).content).toBe("- api\n- web")
+  const { tools, commands, calls, cleanup } = await started()
+  expect([...tools.keys()]).toEqual([
+    "orchestrator_projects",
+    "orchestrator_worker_spawn",
+    "orchestrator_worker_list",
+    "orchestrator_worker_close",
+    "orchestrator_worker_message",
+    "orchestrator_worker_forget",
+  ])
+  expect([...commands.keys()]).toEqual(["orchestrator-worker-join", "orchestrator-worker-close", "orchestrator-pin"])
+  expect((await tools.get("orchestrator_projects").execute({})).content).toBe("- api\n- web")
   const value = calls.find((c) => c.method === "board")?.input.value
   expect(value).toContain("api, web")
+  expect(value).toContain("orchestrator_worker_spawn")
   expect(value).toContain("feat/ABC-123")
+  expect(value).not.toContain("batched")
+  expect(value).toContain("Workers:\nNo workers yet.")
   await cleanup()
 })
 
 test("opens project workers as a herdr worktree space nested under the repo", async () => {
   const runs = fakeShell()
-  const { tools, calls, emit, replies, ask, cleanup } = await started()
+  const { tools, calls, cleanup } = await started()
   expect(calls.find((c) => c.method === "create")?.input.title).toBe("Orchestrator")
 
-  const result = await tools.get("spawn_worker").execute({
+  const result = await tools.get("orchestrator_worker_spawn").execute({
     title: "Fix Login",
     prompt: "do it",
     why: "Login redirect bug from a capture",
@@ -263,150 +258,26 @@ test("opens project workers as a herdr worktree space nested under the repo", as
   expect(pinned).toContain(`Project: ${path.join(home, "web")}`)
   expect(pinned).toContain("Branch: fix/ABC-1-login off origin/develop")
   expect(pinned).toContain("Herdr space: w10")
+  expect(pinned).toContain("Outcome: <what you did and what is left>")
+  expect(pinned).not.toContain("status")
   expect(calls.findIndex((c) => c.input?.key === "orchestrator-origin")).toBeLessThan(calls.findIndex((c) => c.method === "prompt"))
 
-  replies.set("ses_2", [
-    { type: "assistant", content: [{ type: "text", text: "## Done\nFixed the redirect.\n\n**Outcome:** login fixed, PR #12 open" }] },
-  ])
-  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  emit({ type: "session.idle", data: { sessionID: "ses_unrelated" } })
-  await settle()
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Fix Login ses_2 w10 fix/ABC-1-login")
+  const boardValue = calls.filter((c) => c.method === "board" && c.input.sessionID === "ses_1").at(-1)?.input.value
+  expect(boardValue).toEndWith("Workers:\n- Fix Login ses_2 w10 fix/ABC-1-login")
 
-  // Alerts are batched into the orchestrator's next prompt, not streamed as messages.
-  expect(calls.filter((c) => c.method === "synthetic")).toHaveLength(0)
-  expect(await ask("ses_2", "hi")).toBe("hi")
-  expect(await ask("ses_1", "next")).toBe("[Worker updates]\n- Fix Login ses_2: done — login fixed, PR #12 open\n\nnext")
-  expect(await ask("ses_1", "again")).toBe("again")
-  expect((await tools.get("list_workers").execute({})).content).toContain("- done: Fix Login ses_2 w10")
-
-  // A turn the user starts in the worker's own space ends without an alert.
-  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  await settle()
-  expect(await ask("ses_1", "quiet")).toBe("quiet")
-
-  // A follow-up from the orchestrator makes the next finish worth an alert again.
-  await tools.get("message_worker").execute({ sessionID: "ses_2", text: "also check logout" })
-  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  await settle()
-  expect(await ask("ses_1", "x")).toContain("- Fix Login ses_2: done")
-  await cleanup()
-})
-
-test("failures and blocks always alert; a block cleared before the next prompt is dropped", async () => {
-  fakeShell()
-  const { tools, emit, ask, cleanup } = await started()
-  await tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
-  emit({ type: "permission.asked", data: { id: "p1", sessionID: "ses_2", action: "bash", resources: [] } })
-  emit({ type: "permission.replied", data: { sessionID: "ses_2", requestID: "p1", reply: "once" } })
-  await settle()
-  expect(await ask("ses_1", "a")).toBe("a")
-  emit({ type: "session.execution.failed", data: { sessionID: "ses_2", error: { message: "boom" } } })
-  await settle()
-  expect(await ask("ses_1", "b")).toBe("[Worker updates]\n- Fix Login ses_2: failed (boom)\n\nb")
-  await cleanup()
-})
-
-test("notify all alerts every finished turn and off stays silent", async () => {
-  fakeShell()
-  const all = await started({ notify: "all" })
-  await all.tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
-  all.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  await settle()
-  await all.ask("ses_1", "a")
-  all.emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  all.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  await settle()
-  expect(await all.ask("ses_1", "b")).toContain("Fix Login ses_2: done")
-  await all.cleanup()
-
-  fakeShell()
-  const off = await started({ notify: "off" })
-  await off.tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
-  off.emit({ type: "session.execution.failed", data: { sessionID: "ses_2", error: { message: "boom" } } })
-  await settle()
-  expect(await off.ask("ses_1", "b")).toBe("b")
-  await off.cleanup()
-})
-
-test("summarize picks the Outcome line and keeps it short", () => {
-  expect(summarize("Intro\n\n- **Outcome:** shipped `x`")).toBe("shipped x")
-  expect(summarize("\n# Title here\nmore")).toBe("Title here")
-  expect(summarize("a".repeat(200))?.length).toBe(160)
-  expect(summarize("  \n ")).toBeUndefined()
-})
-
-test("serves the sidebar a snapshot and signals each worker change", async () => {
-  fakeShell()
-  const { tools, calls, emit, rpcHandlers, cleanup } = await started()
-  await tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "do it", why: "capture", project: "web" })
-  const before = calls.filter((c) => c.method === "changed").length
-  emit({ type: "session.execution.started", data: { sessionID: "ses_2" } })
-  await settle()
-  expect(calls.filter((c) => c.method === "changed").length).toBeGreaterThan(before)
-  const snapshot = (await rpcHandlers.snapshot({})) as Snapshot
-  expect(snapshot.orchestrator).toBe("ses_1")
-  expect(snapshot.home).toBe(home)
-  expect(snapshot.workers).toEqual([
-    { id: "ses_2", title: "Fix Login", state: "running", space: "w10", updated: expect.any(Number) },
-  ])
-  await cleanup()
-})
-
-test("sidebar view puts workers needing attention first and counts closed ones", () => {
-  const now = 10 * 60_000
-  const worker = (id: string, state: WorkerState, updated: number, extra = {}) => ({ id, title: id, state, updated, ...extra })
-  const result = view(
-    {
-      orchestrator: "ses_1",
-      workers: [
-        worker("done", "done", 0, { space: "w1" }),
-        worker("run", "running", now),
-        worker("blocked", "blocked", 0, { detail: "permission: bash" }),
-        worker("old", "closed", 0),
-      ],
-    },
-    now,
+  expect((await tools.get("orchestrator_worker_message").execute({ sessionID: "ses_2", text: "also logout", steer: true })).content).toBe(
+    "Sent to Fix Login.",
   )
-  expect(result.heading).toBe("Workers · 1 blocked · 1 running · 1 done")
-  expect(result.closed).toBe(1)
-  expect(result.rows.map((r) => [r.id, r.marker, r.tone])).toEqual([
-    ["blocked", "!", "warning"],
-    ["run", "●", "info"],
-    ["done", "✓", "success"],
-  ])
-  expect(result.rows[0].meta).toBe("blocked: permission: bash · 10m ago")
-  expect(result.rows[2].meta).toBe("done · w1 · 10m ago")
-})
-
-test("a worker's own sidebar says it is joined to the orchestrator", () => {
-  const now = 5 * 60_000
-  const snapshot: Snapshot = {
-    orchestrator: "ses_1",
-    workers: [
-      { id: "ses_2", title: "Spawned", state: "running", space: "w10", updated: 0 },
-      { id: "ses_3", title: "Joined", state: "done", attached: true, updated: now },
-      { id: "ses_4", title: "Old", state: "closed", updated: 0 },
-    ],
-  }
-  expect(membership(snapshot, "ses_2", now)).toEqual({
-    heading: "Orchestrator · worker",
-    marker: "●",
-    tone: "info",
-    meta: "running · w10 · 5m ago",
-  })
-  expect(membership(snapshot, "ses_3", now)?.heading).toBe("Orchestrator · joined")
-  expect(membership(snapshot, "ses_4", now)).toBeUndefined()
-  expect(membership(snapshot, "ses_9", now)).toBeUndefined()
-  expect(membership({ workers: snapshot.workers }, "ses_2", now)).toBeUndefined()
+  expect(calls.filter((c) => c.method === "prompt").at(-1)?.input).toEqual({ sessionID: "ses_2", text: "also logout", delivery: "steer" })
+  await expect(tools.get("orchestrator_worker_message").execute({ sessionID: "ses_x", text: "hi" })).rejects.toThrow("not on the worker list")
+  await cleanup()
 })
 
 test("picks branch and base defaults: develop, master for hotfixes, main as a fallback", async () => {
   const runs = fakeShell()
   const { tools, cleanup } = await started()
-  const spawn = tools.get("spawn_worker")
+  const spawn = tools.get("orchestrator_worker_spawn")
   const bases = () => runs.filter((r) => r[1] === "worktree").map((r) => [r.at(-6), r.at(-4)])
 
   await spawn.execute({ title: "New Thing", prompt: "p", why: "w", project: "web" })
@@ -428,7 +299,7 @@ test("picks branch and base defaults: develop, master for hotfixes, main as a fa
 test("ideas outside a repo get a new herdr space in the orchestrator's folder", async () => {
   const runs = fakeShell()
   const { tools, calls, cleanup } = await started()
-  const result = await tools.get("spawn_worker").execute({
+  const result = await tools.get("orchestrator_worker_spawn").execute({
     title: "Research idea",
     prompt: "think",
     why: "From a Scrawl capture; user wants options",
@@ -442,10 +313,13 @@ test("ideas outside a repo get a new herdr space in the orchestrator's folder", 
   expect(created(calls)[0].input.location).toEqual({ directory: home })
   expect(result.content).toContain("herdr space w10")
   expect(runs.some((r) => r[0] === "git")).toBe(false)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Research idea ses_2 w10")
 
-  await expect(tools.get("spawn_worker").execute({ title: "x", prompt: "y", why: "w", project: "notes" })).rejects.toThrow("not a git project")
+  await expect(tools.get("orchestrator_worker_spawn").execute({ title: "x", prompt: "y", why: "w", project: "notes" })).rejects.toThrow(
+    "not a git project",
+  )
   await expect(
-    tools.get("spawn_worker").execute({ title: "x", prompt: "y", why: "w", directory: "notes", worktree: true }),
+    tools.get("orchestrator_worker_spawn").execute({ title: "x", prompt: "y", why: "w", directory: "notes", worktree: true }),
   ).rejects.toThrow("a worktree needs a git project")
   await cleanup()
 })
@@ -453,7 +327,7 @@ test("ideas outside a repo get a new herdr space in the orchestrator's folder", 
 test("retries herdr agent start while a new pane's shell is still busy", async () => {
   const runs = fakeShell({ busy: 2 })
   const { tools, cleanup } = await started()
-  const result = await tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
+  const result = await tools.get("orchestrator_worker_spawn").execute({ title: "Idea", prompt: "p", why: "w" })
   expect(runs.filter((r) => r[1] === "agent")).toHaveLength(3)
   expect(result.content).not.toContain("Could not attach")
   await cleanup()
@@ -462,7 +336,7 @@ test("retries herdr agent start while a new pane's shell is still busy", async (
 test("falls back to an available model and refuses to spawn without one", async () => {
   const runs = fakeShell()
   const fallback = await started({ model: "gone/old-model" })
-  const result = await fallback.tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
+  const result = await fallback.tools.get("orchestrator_worker_spawn").execute({ title: "Idea", prompt: "p", why: "w" })
   expect(created(fallback.calls)[0].input.model).toEqual({ id: "opus", providerID: "anthropic" })
   expect(result.content).toContain("Model gone/old-model is unavailable; using anthropic/opus.")
   await fallback.cleanup()
@@ -470,7 +344,7 @@ test("falls back to an available model and refuses to spawn without one", async 
   const broken = await started({ model: "gone/old-model" })
   broken.ctx.session.get = async () => ({ model: { id: "also-gone", providerID: "gone" } }) as never
   const before = runs.length
-  await expect(broken.tools.get("spawn_worker").execute({ title: "Idea 2", prompt: "p", why: "w" })).rejects.toThrow(
+  await expect(broken.tools.get("orchestrator_worker_spawn").execute({ title: "Idea 2", prompt: "p", why: "w" })).rejects.toThrow(
     "no worker model available (tried gone/old-model, gone/also-gone)",
   )
   expect(runs.slice(before).some((r) => r[1] === "workspace" && r[2] === "create")).toBe(false)
@@ -480,7 +354,7 @@ test("falls back to an available model and refuses to spawn without one", async 
 test("falls back to headless OpenCode worktrees when herdr is unavailable", async () => {
   fakeShell({ herdr: false })
   const { tools, calls, cleanup } = await started()
-  const result = await tools.get("spawn_worker").execute({ title: "Fix", prompt: "p", why: "w", project: "web", branch: "fix/a" })
+  const result = await tools.get("orchestrator_worker_spawn").execute({ title: "Fix", prompt: "p", why: "w", project: "web", branch: "fix/a" })
   expect(created(calls)[0].input.location).toEqual({ directory: path.join(home, "web") })
   expect(calls.find((c) => c.method === "worktree")?.input).toEqual({ projectID: "prj_1", name: "fix-a", branch: "origin/develop" })
   expect(calls.find((c) => c.method === "move")?.input.directory).toBe(path.join(home, ".worktrees", "fix-a"))
@@ -489,100 +363,110 @@ test("falls back to headless OpenCode worktrees when herdr is unavailable", asyn
 })
 
 const spawnLogin = (tools: Map<string, any>) =>
-  tools.get("spawn_worker").execute({ title: "Fix Login", prompt: "p", why: "w", project: "web", branch: "fix/ABC-1-login" })
+  tools
+    .get("orchestrator_worker_spawn")
+    .execute({ title: "Fix Login", prompt: "p", why: "w", project: "web", branch: "fix/ABC-1-login" })
 const loginTree = path.join(home, ".herdr", "web", "fix-ABC-1-login")
-const closedNotes = (calls: { method: string; input: any }[]) =>
-  calls.filter((c) => c.method === "synthetic" && c.input.description?.endsWith("closed")).map((c) => c.input)
 
-test("asks about leftovers when the user closes a worker's herdr space and worktree by hand", async () => {
+test("closing a worker removes its worktree and space, keeps the branch and drops it from the list", async () => {
   const shell = fakeShell()
   const { tools, calls, cleanup } = await started()
   await spawnLogin(tools)
-  rmSync(loginTree, { recursive: true, force: true })
-  shell.spaces.delete("w10")
-
-  const listed = (await tools.get("list_workers").execute({})).content
-  expect(listed).toContain("closed, left branch fix/ABC-1-login (not on origin): Fix Login ses_2")
-  const [note] = closedNotes(calls)
-  expect(note.resume).toBe(true)
-  expect(note.text).toContain("Still left: branch fix/ABC-1-login (not on origin)")
-  expect(note.text).toContain("Ask the user whether to clean these up")
-
-  // Cleaning up after a manual close keeps it marked as closed by the user.
-  const result = await tools.get("close_worker").execute({ sessionID: "ses_2", branch: true })
-  expect(result.content).toBe("Fix Login: deleted branch fix/ABC-1-login.")
-  expect(shell.branches.has("fix/ABC-1-login")).toBe(false)
-  expect((await tools.get("list_workers").execute({})).content).not.toContain("left:")
-  expect(closedNotes(calls)).toHaveLength(1)
-  await cleanup()
-})
-
-test("a deleted session with its worktree still around asks about the worktree", async () => {
-  fakeShell()
-  const { tools, calls, deleted, emit, cleanup } = await started()
-  await spawnLogin(tools)
-  deleted.add("ses_2")
-  emit({ type: "session.deleted", data: { sessionID: "ses_2" } })
-  await settle()
-  const [note] = closedNotes(calls)
-  expect(note.text).toContain("was closed manually: session deleted")
-  expect(note.text).toContain(`herdr space w10; worktree ${loginTree}; branch fix/ABC-1-login`)
-  expect(note.resume).toBe(true)
-  await cleanup()
-})
-
-test("records a closed idea space with nothing left without waking the orchestrator", async () => {
-  const shell = fakeShell()
-  const { tools, calls, ask, cleanup } = await started()
-  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "p", why: "w" })
-  shell.spaces.delete("w10")
-  await tools.get("list_workers").execute({})
-  expect(closedNotes(calls)).toHaveLength(0)
-  expect(await ask("ses_1", "x")).toContain('Worker "Idea" (ses_2) was closed manually: herdr space w10 closed; nothing left to clean up.')
-  await cleanup()
-})
-
-test("close_worker removes the worktree and space without reporting a manual close", async () => {
-  const shell = fakeShell()
-  const { tools, calls, cleanup } = await started()
-  await spawnLogin(tools)
-  const result = await tools.get("close_worker").execute({ sessionID: "ses_2" })
+  shell.pushed.add("fix/ABC-1-login")
+  const result = await tools.get("orchestrator_worker_close").execute({ sessionID: "ses_2" })
   expect(result.content).toBe(
-    "Fix Login: removed worktree and closed herdr space w10.\nStill left: branch fix/ABC-1-login (not on origin).",
+    "Fix Login: removed worktree and closed herdr space w10.\nRemoved from the list.\nLeft: branch fix/ABC-1-login (pushed to origin).",
   )
   expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
   expect(shell.spaces.has("w10")).toBe(false)
-  expect((await tools.get("list_workers").execute({})).content).toContain("closed, left branch fix/ABC-1-login (not on origin): Fix Login ses_2")
-  expect(closedNotes(calls)).toHaveLength(0)
+  expect(shell.branches.has("fix/ABC-1-login")).toBe(true)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("No workers yet.")
+  expect(calls.filter((c) => c.method === "board" && c.input.sessionID === "ses_1").at(-1)?.input.value).toEndWith("No workers yet.")
+  await expect(tools.get("orchestrator_worker_close").execute({ sessionID: "ses_2" })).rejects.toThrow("not on the worker list")
+  await cleanup()
+})
+
+test("closing with branch and session deletes them too", async () => {
+  const shell = fakeShell()
+  const { tools, deleted, cleanup } = await started()
+  await spawnLogin(tools)
+  const result = await tools.get("orchestrator_worker_close").execute({ sessionID: "ses_2", branch: true, session: true })
+  expect(result.content).toBe(
+    "Fix Login: removed worktree and closed herdr space w10, deleted branch fix/ABC-1-login, deleted session.\nRemoved from the list.",
+  )
+  expect(shell.branches.has("fix/ABC-1-login")).toBe(false)
+  expect(deleted.has("ses_2")).toBe(true)
+  await cleanup()
+})
+
+test("closing refuses a worktree with uncommitted changes unless forced", async () => {
+  const shell = fakeShell()
+  const { tools, cleanup } = await started()
+  await spawnLogin(tools)
+  shell.dirty.add(loginTree)
+  const refused = await tools.get("orchestrator_worker_close").execute({ sessionID: "ses_2" })
+  expect(refused.content).toBe(
+    `Fix Login: not closed; ${loginTree} has uncommitted changes.\nPass force: true only if the user confirms discarding it.`,
+  )
+  expect(shell.spaces.has("w10")).toBe(true)
+  expect(shell.some((r) => r[1] === "worktree" && r[2] === "remove")).toBe(false)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toContain("ses_2")
+
+  const forced = await tools.get("orchestrator_worker_close").execute({ sessionID: "ses_2", force: true })
+  expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10", "--force"])
+  expect(forced.content).toContain("Removed from the list.")
+  await cleanup()
+})
+
+test("forget drops a worker without closing anything", async () => {
+  const shell = fakeShell()
+  const { tools, cleanup } = await started()
+  await spawnLogin(tools)
+  expect((await tools.get("orchestrator_worker_forget").execute({ sessionID: "ses_2" })).content).toBe("Forgot ses_2.")
+  expect((await tools.get("orchestrator_worker_forget").execute({ sessionID: "ses_2" })).content).toBe("ses_2 was not on the list.")
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("No workers yet.")
+  expect(shell.spaces.has("w10")).toBe(true)
   await cleanup()
 })
 
 test("re-pins the most recent other session when the orchestrator is deleted", async () => {
   fakeShell()
   const { tools, calls, deleted, sessions, emit, store, cleanup } = await started()
-  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "think", why: "dictation" })
+  await tools.get("orchestrator_worker_spawn").execute({ title: "Idea", prompt: "think", why: "dictation" })
   sessions.push({ id: "ses_2" }, { id: "ses_sub", parentID: "ses_9" }, { id: "ses_9" })
   deleted.add("ses_1")
   emit({ type: "session.deleted", data: { sessionID: "ses_1" } })
   await settle()
   expect(store.get("orchestrator")).toBe("ses_9")
-  const catchUp = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_9")
-  expect(catchUp?.input.text).toContain("previous orchestrator session (ses_1) was deleted")
-  expect(calls.some((c) => c.method === "board" && c.input.sessionID === "ses_9")).toBe(true)
+  const note = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_9")?.input
+  expect(note.text).toContain("previous orchestrator session (ses_1) was deleted")
+  expect(note.resume).toBe(false)
+  expect(calls.find((c) => c.method === "board" && c.input.sessionID === "ses_9")?.input.value).toContain("- Idea ses_2 w10")
+
+  // Deleting a worker's session changes nothing: the list only changes through the tools.
+  emit({ type: "session.deleted", data: { sessionID: "ses_2" } })
+  await settle()
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Idea ses_2 w10")
   await cleanup()
 })
 
-test("keeps pending updates for the next orchestrator after a re-pin", async () => {
+test("creates a new orchestrator when no other session is around", async () => {
   fakeShell()
-  const { tools, deleted, emit, store, ask, cleanup } = await started()
-  await tools.get("spawn_worker").execute({ title: "Idea", prompt: "think", why: "dictation" })
+  const { deleted, emit, store, cleanup } = await started()
   deleted.add("ses_1")
-  emit({ type: "session.idle", data: { sessionID: "ses_2" } })
-  await settle()
   emit({ type: "session.deleted", data: { sessionID: "ses_1" } })
   await settle()
-  expect(store.get("orchestrator")).toBe("ses_3")
-  expect(await ask("ses_3", "hi")).toContain("Idea ses_2: done")
+  expect(store.get("orchestrator")).toBe("ses_2")
+  await cleanup()
+})
+
+test("/orchestrator-pin pins the current session", async () => {
+  const { commands, store, calls, cleanup } = await started()
+  await commands.get("orchestrator-pin").execute({ sessionID: "ses_7" })
+  expect(store.get("orchestrator")).toBe("ses_7")
+  expect(calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_7")?.input.text).toContain(
+    "scrawl send <bundle> --session ses_7",
+  )
   await cleanup()
 })
 
@@ -592,126 +476,111 @@ function externalWorker(shell: ReturnType<typeof fakeShell>, infos: Map<string, 
   mkdirSync(tree, { recursive: true })
   shell.checkouts.set(tree, { root: path.join(home, "web"), checkout: tree, branch: "feat/metrics" })
   shell.spaces.set("w20", tree)
-  shell.labels.set("w20", "Contentstack metrics")
   shell.panes.set("w20", "ses_ext")
-  infos.set("ses_ext", { title: "Contentstack metrics", location: { directory: tree }, time: { created: 1, updated: 5, busy: 5, idle: 3 } })
+  infos.set("ses_ext", { title: "Contentstack metrics", location: { directory: tree } })
   return tree
 }
 
-test("attaches an existing session by its herdr space and tracks it like a spawned worker", async () => {
-  const shell = fakeShell()
-  const { tools, calls, infos, emit, ask, cleanup } = await started()
-  const tree = externalWorker(shell, infos)
-
-  const result = await tools.get("attach_worker").execute({ session: "w20" })
-  expect(result.content).toBe(`Attached "Contentstack metrics" (ses_ext) as running: branch feat/metrics (worktree), ${tree}, herdr space w20.`)
-  const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_ext")?.input
-  expect(pinned.key).toBe("orchestrator-origin")
-  expect(pinned.value).toContain("was attached to the OpenCode orchestrator (ses_1)")
-  expect(pinned.value).toContain('Why: Attached by the user; continue what "Contentstack metrics" was doing.')
-  expect(calls.some((c) => c.method === "create" && c.input.title !== "Orchestrator")).toBe(false)
-  expect((await tools.get("attach_worker").execute({ session: "ses_ext" })).content).toContain("already tracked")
-
-  emit({ type: "session.idle", data: { sessionID: "ses_ext" } })
-  await settle()
-  // The orchestrator did not start this turn, so its end is not worth an alert.
-  expect(await ask("ses_1", "x")).toBe("x")
-  expect((await tools.get("list_workers").execute({})).content).toContain("done: Contentstack metrics ses_ext w20")
-
-  // Closing the space by hand is detected like any other worker.
-  shell.spaces.delete("w20")
-  const closed = (await tools.get("list_workers").execute({})).content
-  expect(closed).toContain("closed, left")
-  expect(closed).toContain("Contentstack metrics ses_ext")
-  await cleanup()
-})
-
-test("a session in a repo's main checkout is attached without claiming the repo's herdr space", async () => {
-  const shell = fakeShell()
-  const { tools, infos, cleanup } = await started()
-  const web = path.join(home, "web")
-  shell.checkouts.set(web, { root: web, checkout: web, branch: "develop" })
-  shell.panes.set("w1", "ses_main")
-  infos.set("ses_main", { title: "Main work", location: { directory: web }, time: { created: 1, updated: 2 } })
-  const result = await tools.get("attach_worker").execute({ session: "ses_main", why: "Keep an eye on it" })
-  expect(result.content).toBe(`Attached "Main work" (ses_main) as done: branch develop, ${web}.`)
-  expect((await tools.get("list_workers").execute({})).content).not.toContain("[herdr w1]")
-  await cleanup()
-})
-
-test("asks which session to attach when several match", async () => {
-  fakeShell()
-  const { tools, sessions, infos, cleanup } = await started()
-  for (const id of ["ses_a", "ses_b"]) {
-    sessions.push({ id })
-    infos.set(id, { title: `Docs cleanup ${id}`, location: { directory: home }, time: { created: 1, updated: 1 } })
-  }
-  const result = (await tools.get("attach_worker").execute({ session: "Docs cleanup" })).content
-  expect(result).toContain("ask the user which one")
-  expect(result).toContain(`- ses_a — Docs cleanup ses_a — ${home}`)
-  expect(result).toContain(`- ses_b — Docs cleanup ses_b — ${home}`)
-  expect((await tools.get("attach_worker").execute({ session: "nothing like it" })).content).toContain("No session matches")
-  await cleanup()
-})
-
-test("/join-orchestrator in another session flags it and the orchestrator adopts it", async () => {
+test("/orchestrator-worker-join in another session flags it and the orchestrator adds it", async () => {
   const away = fakeContext("/elsewhere", { home })
   await plugin.setup(away.ctx as never)
-  await away.commands.get("join-orchestrator").execute({ sessionID: "ses_ext", prompt: { text: "finish the PR" } })
+  await away.commands.get("orchestrator-worker-join").execute({ sessionID: "ses_ext", prompt: { text: "finish the PR" } })
   const flagged = away.calls.find((c) => c.method === "update")?.input
   expect(flagged.metadata.orchestratorJoin).toEqual({ why: "finish the PR", at: expect.any(Number) })
+  expect(away.calls.find((c) => c.method === "synthetic")?.input.text).toContain("worker list")
 
   const shell = fakeShell()
-  const { tools, calls, infos, emit, ask, cleanup } = await started()
+  const { tools, calls, infos, emit, cleanup } = await started()
   externalWorker(shell, infos)
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: flagged.metadata } })
   await settle()
   expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_ext")?.input.metadata.orchestratorJoin).toBeNull()
-  expect(await ask("ses_1", "x")).toStartWith("[Worker updates]\n- Attached")
   const pinned = calls.find((c) => c.method === "board" && c.input.sessionID === "ses_ext")?.input.value
+  expect(pinned).toContain("This session joined the OpenCode orchestrator (ses_1)")
   expect(pinned).toContain("Why: finish the PR")
+  expect(calls.some((c) => c.method === "synthetic" && c.input.sessionID === "ses_1")).toBe(false)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Contentstack metrics ses_ext w20 feat/metrics")
 
-  // The cleared flag echoes back as another metadata update; it must not attach again.
+  // The cleared flag echoes back as another metadata update; it must not add it again after a forget.
+  await tools.get("orchestrator_worker_forget").execute({ sessionID: "ses_ext" })
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_ext", metadata: { orchestratorJoin: null } } })
   await settle()
-  expect(await ask("ses_1", "y")).toBe("y")
-  expect((await tools.get("list_workers").execute({})).content).toContain("ses_ext")
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("No workers yet.")
   await cleanup()
 })
 
-test("/close-worker in a worker flags it and the orchestrator closes it", async () => {
+test("a session in a repo's main checkout joins without claiming the repo's herdr space", async () => {
+  const shell = fakeShell()
+  const { tools, infos, emit, cleanup } = await started()
+  const web = path.join(home, "web")
+  shell.checkouts.set(web, { root: web, checkout: web, branch: "develop" })
+  shell.panes.set("w1", "ses_main")
+  infos.set("ses_main", { title: "Main work", location: { directory: web } })
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_main", metadata: { orchestratorJoin: { why: null } } } })
+  await settle()
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Main work ses_main")
+  await cleanup()
+})
+
+test("/orchestrator-worker-close in a worker flags it and the orchestrator closes it", async () => {
   const away = fakeContext("/elsewhere", { home })
   await plugin.setup(away.ctx as never)
-  await away.commands.get("close-worker").execute({ sessionID: "ses_2", prompt: { text: "branch" } })
+  await away.commands.get("orchestrator-worker-close").execute({ sessionID: "ses_2", prompt: { text: "" } })
   const flagged = away.calls.find((c) => c.method === "update")?.input
-  expect(flagged.metadata.orchestratorClose).toEqual({ branch: true, session: false, force: false, at: expect.any(Number) })
+  expect(flagged.metadata.orchestratorClose).toEqual({ branch: false, session: false, force: false, at: expect.any(Number) })
 
   const shell = fakeShell()
-  const { tools, calls, emit, ask, cleanup } = await started()
+  const { tools, calls, emit, cleanup } = await started()
   await spawnLogin(tools)
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: flagged.metadata } })
   await settle()
   expect(calls.find((c) => c.method === "update" && c.input.sessionID === "ses_2")?.input.metadata.orchestratorClose).toBeNull()
   expect(shell).toContainEqual(["herdr", "worktree", "remove", "--workspace", "w10"])
-  const note = await ask("ses_1", "x")
-  expect(note).toContain("deleted branch fix/ABC-1-login")
-  expect(note).toContain("/close-worker")
-  expect(calls.filter((c) => c.method === "synthetic" && c.input.sessionID === "ses_2")).toHaveLength(0)
-
-  // The cleared flag echoes back; nothing closes twice.
-  emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: { orchestratorClose: null } } })
-  await settle()
-  expect(await ask("ses_1", "y")).toBe("y")
-  expect((await tools.get("list_workers").execute({})).content).toContain("1 closed")
+  expect(shell.branches.has("fix/ABC-1-login")).toBe(true)
+  expect(calls.filter((c) => c.method === "synthetic")).toHaveLength(0)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("No workers yet.")
   await cleanup()
 })
 
-test("/close-worker in an untracked session says so", async () => {
+test("/orchestrator-worker-close in a dirty worker refuses and tells the worker", async () => {
+  const shell = fakeShell()
+  const { tools, calls, emit, cleanup } = await started()
+  await spawnLogin(tools)
+  shell.dirty.add(loginTree)
+  emit({ type: "session.metadata.updated", data: { sessionID: "ses_2", metadata: { orchestratorClose: { at: 1 } } } })
+  await settle()
+  const reply = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_2")?.input.text
+  expect(reply).toContain("has uncommitted changes")
+  expect(reply).toContain("/orchestrator-worker-close force")
+  expect(shell.spaces.has("w10")).toBe(true)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toContain("ses_2")
+  await cleanup()
+})
+
+test("/orchestrator-worker-close in an untracked session says so", async () => {
   fakeShell()
   const { calls, emit, cleanup } = await started()
   emit({ type: "session.metadata.updated", data: { sessionID: "ses_x", metadata: { orchestratorClose: { at: 1 } } } })
   await settle()
   const reply = calls.find((c) => c.method === "synthetic" && c.input.sessionID === "ses_x")
-  expect(reply?.input.text).toContain("not tracked")
+  expect(reply?.input.text).toContain("not on the orchestrator's worker list")
+  await cleanup()
+})
+
+test("migrates a v0.2 registry on load and drops pending updates", async () => {
+  fakeShell()
+  const { tools, store, cleanup } = await started(
+    {},
+    {
+      workers: {
+        ses_a: { id: "ses_a", title: "Open", directory: home, space: "w1", state: "blocked", detail: "permission", asked: true, created: 1, updated: 2 },
+        ses_b: { id: "ses_b", title: "Done", directory: home, state: "closed", closedBy: "user", leftovers: [], created: 2, updated: 3 },
+      },
+      pending: { ses_a: "Open ses_a: blocked" },
+    },
+  )
+  expect(store.get("workers")).toEqual({ ses_a: { id: "ses_a", title: "Open", directory: home, space: "w1", created: 1 } })
+  expect(store.has("pending")).toBe(false)
+  expect((await tools.get("orchestrator_worker_list").execute({})).content).toBe("- Open ses_a w1")
   await cleanup()
 })

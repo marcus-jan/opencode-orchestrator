@@ -63,7 +63,6 @@ export function herdr(bin: string) {
         (result) => new Set<string>((result.workspaces ?? []).map((space: Space) => space.workspace_id)),
         () => undefined,
       ),
-    list: async () => ((await call(["workspace", "list"])).workspaces ?? []) as Space[],
     /** Panes (all, or one space's) with the OpenCode session each one runs. */
     panes: async (workspace?: string) =>
       ((await call(["pane", "list", ...(workspace ? ["--workspace", workspace] : [])])).panes ?? []) as Pane[],
@@ -127,6 +126,13 @@ export const branchExists = (root: string, branch: string) =>
 
 export const branchOnOrigin = (root: string, branch: string) =>
   run("git", ["-C", root, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).then(() => true, () => false)
+
+/** Uncommitted or untracked changes in a checkout. */
+export const isDirty = (checkout: string) =>
+  run("git", ["-C", checkout, "status", "--porcelain"]).then(
+    (out) => out.trim().length > 0,
+    () => false,
+  )
 
 export const removeGitWorktree = (root: string, checkout: string, force: boolean) =>
   run("git", ["-C", root, "worktree", "remove", ...(force ? ["--force"] : []), checkout])

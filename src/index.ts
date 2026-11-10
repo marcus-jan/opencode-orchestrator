@@ -8,69 +8,34 @@ import {
   checkoutInfo,
   deleteBranch,
   herdr,
+  isDirty,
   paneSession,
   removeGitWorktree,
   resolveBase,
   type Opened,
 } from "./herdr"
 import { findProjects, gitRoot, slug } from "./projects"
-import {
-  apply,
-  board,
-  checkoutOf,
-  closure,
-  EVENT_TYPES,
-  isClosed,
-  leftovers,
-  ATTENTION_STATES,
-  transitionFor,
-  type Presence,
-  type Registry,
-  type Worker,
-  type WorkerState,
-} from "./registry"
-import { Orchestrator, type Snapshot } from "./rpc"
+import { board, checkoutOf, migrate, type Registry, type Worker } from "./registry"
 
 const ID = "orchestrator"
 const ORCHESTRATOR_KEY = "orchestrator"
 const WORKERS_KEY = "workers"
 const BOARD_KEY = "orchestrator-workers"
 const ORIGIN_KEY = "orchestrator-origin"
+/** Batched worker updates from v0.2; deleted on load. */
 const PENDING_KEY = "pending"
-
-/** One line from a worker's final message: its `Outcome:` line if present, else the first line. */
-export function summarize(text: string, max = 160) {
-  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean)
-  const marked = lines.find((line) => /^[*_#>\s-]*outcome:/i.test(line))
-  const line = (marked ?? lines[0] ?? "")
-    .replace(/^[#>\s*_-]*(outcome:)?/i, "")
-    .replace(/[*_`]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-  if (!line) return undefined
-  return line.length > max ? `${line.slice(0, max - 1)}…` : line
-}
-
-export type Notify = "attention" | "all" | "off"
 
 export interface Options {
   /** Directory the orchestrator lives in. Only the plugin instance for this location is active. */
   home: string
   /** Title applied to the pinned orchestrator session. */
   title: string
-  /**
-   * Which worker updates reach the orchestrator, batched into its next prompt:
-   * "attention" (failed, blocked, and turns the orchestrator started finishing), "all", or "off".
-   */
-  notify: Notify
   /** Give workers spawned inside a git project their own worktree unless the call says otherwise. */
   worktree: boolean
   /** Herdr binary used to open every worker in its own space, or false to keep workers headless. */
   herdr: string | false
   /** Model for workers as "providerID/modelID"; defaults to the model of the session that spawns them. */
   model?: { providerID: string; id: string }
-  /** How often to check whether workers were closed by hand (herdr space, worktree or session gone). 0 disables. */
-  sweepSeconds: number
 }
 
 export function parseOptions(raw: unknown, fallbackHome: string): Options {
@@ -88,18 +53,12 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
   const model = pick<string | undefined>("model", "string", undefined)
   const slash = model?.indexOf("/") ?? -1
   if (model !== undefined && slash < 1) throw new Error(`${ID}: option "model" must look like "providerID/modelID"`)
-  const rawNotify = options.notify
-  const notify: Notify | undefined =
-    rawNotify === undefined || rawNotify === true ? "attention" : rawNotify === false ? "off" : (["attention", "all", "off"] as const).find((n) => n === rawNotify)
-  if (!notify) throw new Error(`${ID}: option "notify" must be "attention", "all" or "off"`)
   return {
     model: model ? { providerID: model.slice(0, slash), id: model.slice(slash + 1) } : undefined,
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
-    notify,
     worktree: pick("worktree", "boolean", true),
     herdr: (options.herdr as string | false | undefined) ?? defaultHerdr,
-    sweepSeconds: pick("sweepSeconds", "number", 60),
   }
 }
 
@@ -108,7 +67,7 @@ const notFound = (error: unknown) => {
   return /not ?found/i.test(`${e?._tag} ${e?.message} ${String(error)}`)
 }
 
-const NAMING = `spawn_worker: you pick a short "title" and, for repo work, a "branch" (feat/ fix/ chore/ docs/ hotfix/, Jira key uppercase, e.g. feat/ABC-123-short-name; base develop, master for hotfix/). No repo: omit "project". Always pass "why". Keep worker prompts and your replies brief; worker updates arrive batched in the user's next message.`
+const NAMING = `orchestrator_worker_spawn: you pick a short "title" and, for repo work, a "branch" (feat/ fix/ chore/ docs/ hotfix/, Jira key uppercase, e.g. feat/ABC-123-short-name; base develop, master for hotfix/). No repo: omit "project". Always pass "why". Keep worker prompts and your replies brief.`
 
 export interface Origin {
   orchestrator?: string
@@ -119,23 +78,23 @@ export interface Origin {
   directory: string
   space?: string
   spawned: string
-  /** The session existed before and was attached to the orchestrator later. */
-  attached?: boolean
+  /** The session existed before and joined the orchestrator later. */
+  joined?: boolean
 }
 
 /** Standing context pinned into a worker so it knows why it exists after its first prompt is compacted away. */
 export function origin(o: Origin): string {
   const by = `the OpenCode orchestrator${o.orchestrator ? ` (${o.orchestrator})` : ""}`
   return [
-    o.attached
-      ? `This session was attached to ${by} on ${o.spawned}; it now tracks you as a worker.`
+    o.joined
+      ? `This session joined ${by} on ${o.spawned}; it is now on its worker list.`
       : `You are a worker session started by ${by} on ${o.spawned}.`,
     `Why: ${o.why}`,
-    o.project ? `Project: ${o.project}` : o.attached ? undefined : "Not tied to a repo: this is an idea space. Do not edit sibling repos; recommend a repo worker when code work is needed.",
+    o.project ? `Project: ${o.project}` : o.joined ? undefined : "Not tied to a repo: this is an idea space. Do not edit sibling repos; recommend a repo worker when code work is needed.",
     o.branch && `Branch: ${o.branch}${o.base ? ` off ${o.base}` : ""}`,
     `Working directory: ${o.directory}`,
     o.space && `Herdr space: ${o.space}`,
-    "The orchestrator only tracks your status. End your final message with one line: `Outcome: <what you did and what is left>`.",
+    "End your final message with one line: `Outcome: <what you did and what is left>`.",
   ]
     .filter(Boolean)
     .join("\n")
@@ -147,12 +106,12 @@ const str = (value: unknown, name: string, required = true) => {
   return value.trim()
 }
 
-/** Session metadata key /join-orchestrator sets; the home instance sees it through the global event stream. */
+/** Session metadata key /orchestrator-worker-join sets; the home instance sees it through the global event stream. */
 export const JOIN_KEY = "orchestratorJoin"
 
 const JOIN_COMMAND = {
-  name: "join-orchestrator",
-  description: "Ask the orchestrator to track this session as a worker (optional: why)",
+  name: "orchestrator-worker-join",
+  description: "Add this session to the orchestrator's worker list (optional: why)",
 }
 
 /** Works from any location: it only flags the session, so it doesn't need the home instance's state. */
@@ -162,16 +121,16 @@ const requestJoin = (ctx: Plugin.Context) => async ({ sessionID, prompt }: { ses
   await ctx.session.update({ sessionID, metadata: { ...(info.metadata ?? {}), [JOIN_KEY]: { why, at: Date.now() } } })
   await ctx.session.synthetic({
     sessionID,
-    text: "Asked the orchestrator to track this session. It will appear on its worker board and sidebar.",
+    text: "Asked the orchestrator to add this session to its worker list.",
     resume: false,
   })
 }
 
-/** Session metadata key /close-worker sets; the home instance closes the worker when it sees it. */
+/** Session metadata key /orchestrator-worker-close sets; the home instance closes the worker when it sees it. */
 export const CLOSE_KEY = "orchestratorClose"
 
 const CLOSE_COMMAND = {
-  name: "close-worker",
+  name: "orchestrator-worker-close",
   description: "Close this worker: remove its worktree and herdr space (add: branch, session, force)",
 }
 
@@ -195,21 +154,18 @@ export default Plugin.define({
     // The server creates one plugin instance per location and events are global,
     // so only the instance for the orchestrator's home does any work.
     if (path.resolve(ctx.location.directory) !== options.home) {
-      // Answer with an empty board that points sidebars on other sessions at the home instance.
-      const idle = await ctx.rpc.register(Orchestrator, {
-        snapshot: async () => ({ home: options.home, workers: [] }) satisfies Snapshot,
-      })
       await ctx.command.transform((editor) => {
         editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) })
         editor.add({ ...CLOSE_COMMAND, execute: requestClose(ctx) })
       })
-      return () => void idle.dispose()
+      return
     }
 
     const controller = new AbortController()
-    let registry = ((await ctx.storage.get(WORKERS_KEY)) ?? {}) as unknown as Registry
+    let registry: Registry = migrate(await ctx.storage.get(WORKERS_KEY))
     let orchestratorID = (await ctx.storage.get(ORCHESTRATOR_KEY)) as string | undefined
-    let pending = ((await ctx.storage.get(PENDING_KEY)) ?? {}) as Record<string, string>
+    await ctx.storage.set(WORKERS_KEY, registry as never)
+    await ctx.storage.remove(PENDING_KEY).catch(() => ctx.storage.set(PENDING_KEY, {}))
 
     let chain = Promise.resolve()
     const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
@@ -220,36 +176,12 @@ export default Plugin.define({
 
     const save = () => ctx.storage.set(WORKERS_KEY, registry as never)
 
-    // Feeds the TUI sidebar shown in the orchestrator session.
-    const rpc = await ctx.rpc.register(Orchestrator, {
-      // RPC output must be plain JSON, so drop undefined fields.
-      snapshot: async () =>
-        JSON.parse(
-          JSON.stringify({
-            home: options.home,
-            orchestrator: orchestratorID,
-            workers: Object.values(registry).map(({ id, title, state, detail, space, attached, updated }) => ({
-              id,
-              title,
-              state,
-              detail,
-              space,
-              attached,
-              updated,
-            })),
-          } satisfies Snapshot),
-        ),
-    })
-    const changed = () =>
-      rpc.events.emit("changed", {}).catch((error: unknown) => console.warn(`[${ID}]`, "failed to emit change", error))
-
     const published = new Map<string, string>()
     const publish = async () => {
-      void changed()
       if (!orchestratorID) return
       const projects = await findProjects(options.home)
       const value = [
-        `Git projects under ${options.home} (spawn_worker "project"): ${projects.join(", ") || "none"}`,
+        `Git projects under ${options.home} (orchestrator_worker_spawn "project"): ${projects.join(", ") || "none"}`,
         `Workers in a project get their own worktree by default: ${options.worktree ? "yes" : "no"}`,
         NAMING,
         `Workers:\n${board(registry)}`,
@@ -262,12 +194,9 @@ export default Plugin.define({
         .catch((error: unknown) => console.warn(`[${ID}]`, "failed to publish board", error))
     }
 
-    // Alerts that could not be delivered because the orchestrator session was gone; replayed on re-pin.
-    const missed: { text: string; resume: boolean }[] = []
-
     /**
      * Pins a replacement after the orchestrator session disappears: the most recently used other root
-     * session in home that is not a worker, else a new one. It gets a catch-up of missed alerts.
+     * session in home that is not a worker, else a new one.
      */
     const repin = async (previous?: string) => {
       const listed = previous
@@ -278,130 +207,23 @@ export default Plugin.define({
       const candidate = listed?.data.find((session) => session.id !== previous && !session.parentID && !registry[session.id])
       const sessionID =
         candidate?.id ?? (await ctx.session.create({ title: options.title, location: { directory: options.home } })).id
-      if (previous) console.warn(`[${ID}]`, `orchestrator ${previous} is gone; pinned ${sessionID}`)
       await pin(sessionID)
-      const replay = missed.splice(0)
-      if (previous || replay.length) {
-        const text = [
-          previous
-            ? `The previous orchestrator session (${previous}) was deleted, so this session is now the orchestrator.`
-            : "This session is now the orchestrator.",
-          replay.length ? `Missed while there was no orchestrator:\n${replay.map((m) => `- ${m.text}`).join("\n")}` : "",
-          `Send captures here with: scrawl send <bundle> --session ${sessionID}`,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
+      if (previous) {
+        console.warn(`[${ID}]`, `orchestrator ${previous} is gone; pinned ${sessionID}`)
         await ctx.session
           .synthetic({
             sessionID,
-            text,
+            text: `The previous orchestrator session (${previous}) was deleted, so this session is now the orchestrator.\n\nSend captures here with: scrawl send <bundle> --session ${sessionID}`,
             description: "Orchestrator re-pinned",
             delivery: "queue",
-            resume: replay.some((m) => m.resume),
+            resume: false,
           })
-          .catch((error: unknown) => console.warn(`[${ID}]`, "failed to post catch-up", error))
+          .catch((error: unknown) => console.warn(`[${ID}]`, "failed to post re-pin note", error))
       }
       return sessionID
     }
 
-    /** Posts an alert to the orchestrator, re-pinning first if its session was deleted. */
-    const tell = async (text: string, description: string, resume: boolean, key?: string) => {
-      if (options.notify === "off") return
-      // Anything that doesn't need an answer now waits for the orchestrator's next prompt.
-      if (!resume) {
-        pending[key ?? `note:${Date.now()}`] = text
-        await ctx.storage.set(PENDING_KEY, pending as never)
-        return
-      }
-      const sessionID = orchestratorID
-      if (!sessionID) {
-        missed.push({ text, resume })
-        await repin()
-        return
-      }
-      await ctx.session
-        .synthetic({ sessionID, text, description, delivery: "queue", resume })
-        .catch(async (error: unknown) => {
-          if (!notFound(error)) return console.warn(`[${ID}]`, "failed to notify orchestrator", error)
-          missed.push({ text, resume })
-          await repin(sessionID)
-        })
-    }
-
-    const notify = async (worker: Worker) => {
-      const detail = worker.detail ? ` (${worker.detail})` : ""
-      const result = worker.state === "done" ? await outcome(worker.id) : undefined
-      await tell(`${worker.title} ${worker.id}: ${worker.state}${detail}${result ? ` — ${result}` : ""}`, "", false, worker.id)
-    }
-
-    /** One line from the worker's last reply: its `Outcome:` line, else its first line. */
-    const outcome = async (sessionID: string) => {
-      const messages = await ctx.session.context({ sessionID }).catch(() => [])
-      const last = [...(messages as readonly { type?: string; content?: { type?: string; text?: string }[] }[])]
-        .reverse()
-        .find((m) => m.type === "assistant" && m.content?.some((c) => c.type === "text" && c.text?.trim()))
-      return summarize(last?.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n") ?? "")
-    }
-
-    /** Folds pending updates into the orchestrator's next prompt instead of one message per update. */
-    const flush = (input: { sessionID: string; prompt: { text?: string } }) => {
-      if (input.sessionID !== orchestratorID) return
-      const lines = Object.values(pending)
-      if (!lines.length) return
-      pending = {}
-      void ctx.storage.set(PENDING_KEY, {} as never)
-      input.prompt.text = `[Worker updates]\n${lines.map((l) => `- ${l}`).join("\n")}\n\n${input.prompt.text ?? ""}`
-    }
-
     const mux = options.herdr ? herdr(options.herdr) : undefined
-
-    const presence = async (worker: Worker, spaces: Set<string> | undefined): Promise<Presence> => {
-      const checkout = checkoutOf(worker)
-      const exists = worker.project && worker.worktree ? await branchExists(worker.project, worker.worktree) : false
-      return {
-        session: await ctx.session.get({ sessionID: worker.id }).then(
-          () => true,
-          (error: unknown) => !notFound(error),
-        ),
-        space: worker.space && spaces ? spaces.has(worker.space) : undefined,
-        worktree: checkout ? existsSync(checkout) : undefined,
-        branch: exists ? { exists, pushed: await branchOnOrigin(worker.project!, worker.worktree!) } : undefined,
-      }
-    }
-
-    const notifyClosed = async (worker: Worker) => {
-      const left = worker.leftovers ?? []
-      const text = left.length
-        ? `Worker "${worker.title}" (${worker.id}) was ${worker.detail}. Still left: ${left.join("; ")}. ` +
-          `Ask the user whether to clean these up. If they agree, call close_worker for ${worker.id} ` +
-          `(pass branch: true only if they want the branch deleted). Do not clean up without asking.`
-        : `Worker "${worker.title}" (${worker.id}) was ${worker.detail}; nothing left to clean up.`
-      // Only wake the orchestrator when there is something to ask about.
-      await tell(text, `${worker.title} closed`, left.length > 0)
-    }
-
-    // Workers close_worker is tearing down, so a sweep mid-way doesn't report them as closed by hand.
-    const closing = new Set<string>()
-
-    /** Marks workers whose herdr space, worktree or session disappeared without close_worker as closed by the user. */
-    const sweep = () =>
-      enqueue(async () => {
-        const open = Object.values(registry).filter((worker) => !isClosed(worker) && !closing.has(worker.id))
-        if (!open.length) return
-        const spaces = mux ? await mux.spaces() : undefined
-        const closed: Worker[] = []
-        for (const worker of open) {
-          const found = closure(worker, await presence(worker, spaces))
-          if (!found) continue
-          const next: Worker = { ...worker, state: "closed", closedBy: "user", ...found, updated: Date.now() }
-          registry[worker.id] = next
-          closed.push(next)
-        }
-        if (!closed.length) return
-        await save()
-        await publish()
-        for (const worker of closed) await notifyClosed(worker)
-      }).catch((error: unknown) => console.warn(`[${ID}]`, "sweep failed", error))
 
     const pin = async (sessionID: string) => {
       orchestratorID = sessionID
@@ -445,33 +267,26 @@ export default Plugin.define({
     }
 
     /**
-     * Tracks a session that was started outside the orchestrator. Repo, branch and worktree come from its
-     * folder and the herdr space from the pane running it; nothing new is created.
+     * Adds a session that joined from inside itself. Repo, branch and worktree come from its folder and
+     * the herdr space from the pane running it; nothing new is created.
      */
     const adopt = async (sessionID: string, why: string | undefined) => {
       if (sessionID === orchestratorID) throw new Error("that is the orchestrator session itself")
-      const info = await ctx.session.get({ sessionID }).catch((error: unknown) => {
-        throw notFound(error) ? new Error(`session ${sessionID} does not exist`) : error
-      })
-      if (info.parentID) throw new Error(`${sessionID} is a subagent session; attach its parent ${info.parentID} instead`)
-      const current = registry[sessionID]
-      if (current && !isClosed(current)) return `"${current.title}" (${sessionID}) is already tracked.`
+      const info = await ctx.session.get({ sessionID })
+      if (info.parentID) throw new Error(`${sessionID} is a subagent session`)
+      if (registry[sessionID]) return
 
       const directory = info.location.directory
       const git = await checkoutInfo(directory)
       const linked = git?.linked && git.branch ? git : undefined
       const panes = mux && (await mux.available()) ? await mux.panes().catch(() => []) : []
-      // A session in a repo's main checkout shares the repo's own space; close_worker must never close that.
+      // A session in a repo's main checkout shares the repo's own space; closing the worker must never close that.
       const found = panes.find((pane) => paneSession(pane) === sessionID)?.workspace_id
       const space = linked || !git ? found : undefined
-      const time = info.time as { busy?: number; idle?: number }
-      const state: WorkerState =
-        time.busy && (!time.idle || time.busy > time.idle) ? "running" : info.outcome === "failed" ? "failed" : "done"
       const title = info.title || sessionID
-      const reason = why ?? `Attached by the user; continue what "${title}" was doing.`
+      const reason = why ?? `Joined by the user; continue what "${title}" was doing.`
 
       await enqueue(async () => {
-        const now = Date.now()
         registry[sessionID] = {
           id: sessionID,
           title,
@@ -481,10 +296,7 @@ export default Plugin.define({
           checkout: linked?.checkout,
           space,
           why: reason,
-          attached: true,
-          state,
-          created: now,
-          updated: now,
+          created: Date.now(),
         }
         await save()
         await publish()
@@ -500,68 +312,16 @@ export default Plugin.define({
           directory,
           space,
           spawned: new Date().toISOString(),
-          attached: true,
+          joined: true,
         }),
       })
-      const where = [git?.branch && `branch ${git.branch}${linked ? " (worktree)" : ""}`, directory, space && `herdr space ${space}`]
-      return `Attached "${title}" (${sessionID}) as ${state}: ${where.filter(Boolean).join(", ")}.`
-    }
-
-    /**
-     * Finds sessions matching what the user said: a session id, a herdr space id or label, or words from
-     * the session title. Root sessions only, newest first, never the orchestrator.
-     */
-    const findSessions = async (query: string) => {
-      const q = query.trim()
-      if (/^ses_\w+$/.test(q)) return [q]
-      const found = new Set<string>()
-      if (mux && (await mux.available())) {
-        const spaces = await mux.list().catch(() => [])
-        const lower = q.toLowerCase()
-        const hits = spaces.filter((s) => s.workspace_id.toLowerCase() === lower || s.label.toLowerCase().includes(lower))
-        for (const space of hits) {
-          for (const pane of await mux.panes(space.workspace_id).catch(() => [])) {
-            const id = paneSession(pane)
-            if (id) found.add(id)
-          }
-        }
-      }
-      const listed = await ctx.session.list({ search: q, parentID: null, order: "desc", limit: 10 }).catch(() => undefined)
-      for (const session of listed?.data ?? []) if (!session.parentID) found.add(session.id)
-      found.delete(orchestratorID ?? "")
-      return [...found]
-    }
-
-    const attach = async (query: string, why: string | undefined) => {
-      const matches = await findSessions(query)
-      if (matches.length === 1) return adopt(matches[0], why)
-      if (!matches.length) return `No session matches "${query}". Try its session id, herdr space (e.g. w4K) or title words.`
-      const lines = await Promise.all(
-        matches.map(async (id) => {
-          const info = await ctx.session.get({ sessionID: id }).catch(() => undefined)
-          return `- ${id} — ${info?.title ?? "?"} — ${info?.location.directory ?? "?"}${registry[id] && !isClosed(registry[id]) ? " (already tracked)" : ""}`
-        }),
-      )
-      return `Several sessions match "${query}"; ask the user which one, then call attach_worker with its session id:\n${lines.join("\n")}`
     }
 
     await ctx.command.transform((editor) => {
       editor.add({ ...JOIN_COMMAND, execute: requestJoin(ctx) })
       editor.add({ ...CLOSE_COMMAND, execute: requestClose(ctx) })
       editor.add({
-        name: "attach",
-        description: "Track an existing session as a worker: session id, herdr space (w4K) or title words",
-        execute: ({ sessionID, prompt }) =>
-          (async () => {
-            const query = prompt?.text?.trim()
-            const text = query
-              ? await attach(query, undefined).catch((error: unknown) => `Could not attach "${query}": ${String(error).replace(/^Error: /, "")}`)
-              : "Usage: /attach <session id | herdr space id or label | title words>"
-            await ctx.session.synthetic({ sessionID, text, description: "Attach worker", resume: false })
-          })(),
-      })
-      editor.add({
-        name: "orchestrator",
+        name: "orchestrator-pin",
         description: "Pin this session as the orchestrator (send Scrawl/Hex here)",
         execute: ({ sessionID }) =>
           enqueue(async () => {
@@ -575,10 +335,22 @@ export default Plugin.define({
       })
     })
 
-    /** Removes what is left of a worker; failures (dirty worktree, unmerged branch) are reported, not forced. */
+    // Workers being closed, so a second close request doesn't race the first.
+    const closing = new Set<string>()
+
+    /**
+     * Removes a worker's worktree and herdr space (and optionally branch and session), then drops it from
+     * the list. Refuses a dirty worktree unless forced; any failure keeps the worker on the list.
+     */
     const closeWorker = async (worker: Worker, input: Record<string, unknown>) => {
       const sessionID = worker.id
       const force = input.force === true
+      const checkout = checkoutOf(worker)
+      const tree = input.worktree !== false && !!checkout && existsSync(checkout)
+      if (tree && !force && (await isDirty(checkout!))) {
+        return { content: `${worker.title}: not closed; ${checkout} has uncommitted changes.`, failed: true }
+      }
+
       const done: string[] = []
       const kept: string[] = []
       const attempt = async (label: string, task: () => Promise<unknown>) =>
@@ -588,62 +360,64 @@ export default Plugin.define({
         )
 
       const spaces = mux ? await mux.spaces() : undefined
-      const before = await presence(worker, spaces)
-      const checkout = checkoutOf(worker)
-      if (input.worktree !== false && before.worktree && checkout) {
-        if (worker.space && before.space) {
-          await attempt(`removed worktree and closed herdr space ${worker.space}`, () =>
-            mux!.removeWorktree(worker.space!, force),
-          )
+      const space = !!worker.space && !!spaces?.has(worker.space)
+      if (tree) {
+        if (space) {
+          await attempt(`removed worktree and closed herdr space ${worker.space}`, () => mux!.removeWorktree(worker.space!, force))
         } else {
-          await attempt("removed worktree", () => removeGitWorktree(worker.project!, checkout, force))
+          await attempt("removed worktree", () => removeGitWorktree(worker.project!, checkout!, force))
         }
       }
-      if (worker.space && before.space && !done.some((d) => d.includes(worker.space!))) {
+      if (space && !done.some((d) => d.includes(worker.space!))) {
         await attempt(`closed herdr space ${worker.space}`, () => mux!.closeSpace(worker.space!))
       }
-      if (input.branch === true && before.branch?.exists) {
+      const branch = !!worker.project && !!worker.worktree && (await branchExists(worker.project, worker.worktree))
+      if (input.branch === true && branch) {
         await attempt(`deleted branch ${worker.worktree}`, () => deleteBranch(worker.project!, worker.worktree!, force))
       }
-      if (input.session === true && before.session) {
-        await attempt("deleted session", () => ctx.session.remove({ sessionID }))
+      if (input.session === true) {
+        await attempt("deleted session", () =>
+          ctx.session.remove({ sessionID }).catch((error: unknown) => {
+            if (!notFound(error)) throw error
+          }),
+        )
       }
 
+      const left = [
+        checkout && existsSync(checkout) && `worktree ${checkout}`,
+        worker.project && worker.worktree && (await branchExists(worker.project, worker.worktree)) &&
+          `branch ${worker.worktree} (${(await branchOnOrigin(worker.project, worker.worktree)) ? "pushed to origin" : "not on origin"})`,
+      ].filter((part): part is string => !!part)
+
       return enqueue(async () => {
-        const after = await presence(worker, mux ? await mux.spaces() : undefined)
-        const left = leftovers(worker, after)
-        registry[sessionID] = {
-          ...registry[sessionID],
-          state: "closed",
-          closedBy: registry[sessionID].closedBy ?? "orchestrator",
-          detail: registry[sessionID].closedBy === "user" ? registry[sessionID].detail : "closed by orchestrator",
-          leftovers: left,
-          updated: Date.now(),
-        }
+        if (!kept.length) delete registry[sessionID]
         await save()
         await publish()
         const lines = [
           `${worker.title}: ${done.join(", ") || "nothing to remove"}.`,
-          kept.length && `Not done: ${kept.join("; ")}. Pass force: true only if the user confirms discarding it.`,
-          left.length && `Still left: ${left.join("; ")}.`,
+          kept.length ? `Not done: ${kept.join("; ")}. Still on the list.` : "Removed from the list.",
+          left.length && `Left: ${left.join("; ")}.`,
         ]
         return { content: lines.filter(Boolean).join("\n"), failed: kept.length > 0 }
       })
     }
 
-    /** /close-worker from inside a worker: close it, then report to the orchestrator (and to the worker if anything failed). */
+    /** /orchestrator-worker-close from inside a worker; the worker only hears back if something was not done. */
     const closeFromWorker = async (sessionID: string, request: Record<string, unknown>) => {
       const worker = registry[sessionID]
       const reply = (text: string) =>
         ctx.session.synthetic({ sessionID, text, description: "Close worker", resume: false }).catch(() => undefined)
-      if (!worker) return void (await reply("This session is not tracked by the orchestrator. Run /join-orchestrator first, or close it by hand."))
-      if (isClosed(worker) || closing.has(sessionID)) return void (await reply("The orchestrator has already closed this worker."))
+      if (!worker) {
+        return void (await reply("This session is not on the orchestrator's worker list. Run /orchestrator-worker-join first, or close it by hand."))
+      }
+      if (closing.has(sessionID)) return
       closing.add(sessionID)
       try {
         const result = await closeWorker(worker, request)
-        await tell(`${result.content}\n(Closed from the worker with /close-worker.)`, "Worker closed", false)
         if (result.failed) {
-          await reply(`${result.content}\nCommit or stash your changes and run /close-worker again, or run /close-worker force to discard them.`)
+          await reply(
+            `${result.content}\nCommit or stash your changes and run /orchestrator-worker-close again, or run /orchestrator-worker-close force to discard them.`,
+          )
         }
       } finally {
         closing.delete(sessionID)
@@ -651,9 +425,9 @@ export default Plugin.define({
     }
 
     await ctx.tool.transform((editor) => {
-      editor.namespace({ name: ID, description: "Spawn and track worker OpenCode sessions" })
+      editor.namespace({ name: ID, description: "Spawn and manage worker OpenCode sessions" })
       editor.add({
-        name: "list_projects",
+        name: "orchestrator_projects",
         description: `List the git projects (folders under ${options.home}) that workers can be spawned in.`,
         input: { type: "object", properties: {}, additionalProperties: false },
         options: { namespace: ID },
@@ -663,9 +437,9 @@ export default Plugin.define({
         },
       })
       editor.add({
-        name: "spawn_worker",
+        name: "orchestrator_worker_spawn",
         description:
-          "Start a new OpenCode worker for an idea. Inside a project it gets a new branch + worktree opened as a herdr space nested under the repo; otherwise a new herdr space in the orchestrator's folder. Opens in the background; status appears on your worker board.",
+          "Start a new OpenCode worker for an idea. Inside a project it gets a new branch + worktree opened as a herdr space nested under the repo; otherwise a new herdr space in the orchestrator's folder. Opens in the background and appears on your worker list.",
         input: {
           type: "object",
           properties: {
@@ -673,7 +447,7 @@ export default Plugin.define({
             prompt: { type: "string", description: "Full task for the worker; it has no other context" },
             project: {
               type: "string",
-              description: `Project folder under ${options.home} (see list_projects), e.g. "my-app". Omit for ideas not tied to a repo`,
+              description: `Project folder under ${options.home} (see orchestrator_projects), e.g. "my-app". Omit for ideas not tied to a repo`,
             },
             directory: {
               type: "string",
@@ -757,7 +531,6 @@ export default Plugin.define({
           }
 
           await enqueue(async () => {
-            const now = Date.now()
             registry[session.id] = {
               id: session.id,
               title,
@@ -767,10 +540,7 @@ export default Plugin.define({
               checkout,
               space: space?.workspace,
               why,
-              state: "queued",
-              asked: true,
-              created: now,
-              updated: now,
+              created: Date.now(),
             }
             await save()
           })
@@ -808,19 +578,16 @@ export default Plugin.define({
         },
       })
       editor.add({
-        name: "list_workers",
-        description: "Show every worker session and its current status.",
+        name: "orchestrator_worker_list",
+        description: "Show every worker on the list.",
         input: { type: "object", properties: {}, additionalProperties: false },
         options: { namespace: ID },
-        execute: async () => {
-          await sweep()
-          return { content: board(registry) }
-        },
+        execute: async () => ({ content: board(registry) }),
       })
       editor.add({
-        name: "close_worker",
+        name: "orchestrator_worker_close",
         description:
-          "Close a worker the user is finished with, or clean up what is left after they closed one by hand: removes its worktree (closing its herdr space) and optionally its branch and session. Only call when the user asks.",
+          "Close a worker the user is finished with: removes its worktree (closing its herdr space) and optionally its branch and session, then drops it from the list. The result says what is left (e.g. whether the branch is pushed) so you can ask the user. Only call when the user asks.",
         input: {
           type: "object",
           properties: {
@@ -841,17 +608,20 @@ export default Plugin.define({
           const input = raw as Record<string, unknown>
           const sessionID = str(input.sessionID, "sessionID")!
           const worker = registry[sessionID]
-          if (!worker) throw new Error(`${sessionID} is not a tracked worker`)
+          if (!worker) throw new Error(`${sessionID} is not on the worker list`)
+          if (closing.has(sessionID)) return { content: `${worker.title} is already being closed.` }
           closing.add(sessionID)
           try {
-            return { content: (await closeWorker(worker, input)).content }
+            const result = await closeWorker(worker, input)
+            const hint = result.failed ? "\nPass force: true only if the user confirms discarding it." : ""
+            return { content: `${result.content}${hint}` }
           } finally {
             closing.delete(sessionID)
           }
         },
       })
       editor.add({
-        name: "message_worker",
+        name: "orchestrator_worker_message",
         description: "Send a follow-up prompt to an existing worker session.",
         input: {
           type: "object",
@@ -867,11 +637,7 @@ export default Plugin.define({
         execute: async (raw) => {
           const input = raw as Record<string, unknown>
           const sessionID = str(input.sessionID, "sessionID")!
-          if (!registry[sessionID]) throw new Error(`${sessionID} is not a tracked worker`)
-          await enqueue(async () => {
-            registry[sessionID].asked = true
-            await save()
-          })
+          if (!registry[sessionID]) throw new Error(`${sessionID} is not on the worker list`)
           await ctx.session.prompt({
             sessionID,
             text: str(input.text, "text")!,
@@ -881,30 +647,8 @@ export default Plugin.define({
         },
       })
       editor.add({
-        name: "attach_worker",
-        description:
-          "Start tracking a session the orchestrator did not spawn (status, alerts, close detection, sidebar). Only when the user asks. If several sessions match, ask the user which one.",
-        input: {
-          type: "object",
-          properties: {
-            session: {
-              type: "string",
-              description: "Session id, herdr space id or label (e.g. w4K), or words from the session title",
-            },
-            why: { type: "string", description: "What the user wants from this session, if they said. Pinned in its context" },
-          },
-          required: ["session"],
-          additionalProperties: false,
-        },
-        options: { namespace: ID },
-        execute: async (raw) => {
-          const input = raw as Record<string, unknown>
-          return { content: await attach(str(input.session, "session")!, str(input.why, "why", false)) }
-        },
-      })
-      editor.add({
-        name: "forget_worker",
-        description: "Stop tracking a worker (does not delete its session).",
+        name: "orchestrator_worker_forget",
+        description: "Drop a worker from the list without closing anything (does not delete its session).",
         input: {
           type: "object",
           properties: { sessionID: { type: "string" } },
@@ -915,10 +659,11 @@ export default Plugin.define({
         execute: async (raw) => {
           const sessionID = str((raw as Record<string, unknown>).sessionID, "sessionID")!
           return enqueue(async () => {
-            const existed = delete registry[sessionID]
+            const existed = sessionID in registry
+            delete registry[sessionID]
             await save()
             await publish()
-            return { content: existed ? `Forgot ${sessionID}.` : `${sessionID} was not tracked.` }
+            return { content: existed ? `Forgot ${sessionID}.` : `${sessionID} was not on the list.` }
           })
         },
       })
@@ -926,33 +671,8 @@ export default Plugin.define({
 
     void (async () => {
       try {
-        const types = [...EVENT_TYPES, "session.metadata.updated"] as const
+        const types = ["session.metadata.updated", "session.deleted"] as const
         for await (const event of ctx.event.subscribe({ types: [...types], signal: controller.signal })) {
-          if (event.type === "session.metadata.updated") {
-            const data = event.data as { sessionID?: string; metadata?: Record<string, unknown> }
-            const join = data.metadata?.[JOIN_KEY] as { why?: string | null } | null | undefined
-            const close = data.metadata?.[CLOSE_KEY] as Record<string, unknown> | null | undefined
-            if (data.sessionID && close && typeof close === "object") {
-              const sessionID = data.sessionID
-              await ctx.session
-                .update({ sessionID, metadata: { ...data.metadata, [CLOSE_KEY]: null } as never })
-                .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear close request", error))
-              void closeFromWorker(sessionID, close).catch((error: unknown) =>
-                console.warn(`[${ID}]`, `failed to close ${sessionID}`, error),
-              )
-              continue
-            }
-            if (!data.sessionID || !join || typeof join !== "object") continue
-            const sessionID = data.sessionID
-            // Clear the request first so later metadata updates don't re-attach a worker the user forgot.
-            await ctx.session
-              .update({ sessionID, metadata: { ...data.metadata, [JOIN_KEY]: null } as never })
-              .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear join request", error))
-            void adopt(sessionID, join.why ?? undefined)
-              .then((text) => tell(text, "Session joined", false))
-              .catch((error: unknown) => console.warn(`[${ID}]`, `failed to attach ${sessionID}`, error))
-            continue
-          }
           if (event.type === "session.deleted") {
             const data = event.data as { sessionID?: string }
             if (data.sessionID && data.sessionID === orchestratorID) {
@@ -960,31 +680,32 @@ export default Plugin.define({
               void enqueue(async () => {
                 if (orchestratorID === previous) await repin(previous)
               }).catch((error) => console.warn(`[${ID}]`, "failed to re-pin orchestrator", error))
-            } else if (data.sessionID && registry[data.sessionID]) void sweep()
+            }
             continue
           }
-          const transition = transitionFor(event)
-          if (!transition?.sessionID || !registry[transition.sessionID]) continue
-          await enqueue(async () => {
-            const worker = apply(registry, transition)
-            if (!worker) return
-            await save()
-            await publish()
-            const ended = worker.state === "done" || worker.state === "failed"
-            const asked = worker.asked
-            if (ended && asked) {
-              worker.asked = false
-              await save()
-            }
-            if (transition.unblock && pending[worker.id]) {
-              delete pending[worker.id]
-              await ctx.storage.set(PENDING_KEY, pending as never)
-            }
-            const wanted =
-              ATTENTION_STATES.has(worker.state) ||
-              (worker.state === "done" && (asked || options.notify === "all"))
-            if (wanted) await notify(worker)
-          })
+          if (event.type !== "session.metadata.updated") continue
+          const data = event.data as { sessionID?: string; metadata?: Record<string, unknown> }
+          const join = data.metadata?.[JOIN_KEY] as { why?: string | null } | null | undefined
+          const close = data.metadata?.[CLOSE_KEY] as Record<string, unknown> | null | undefined
+          if (data.sessionID && close && typeof close === "object") {
+            const sessionID = data.sessionID
+            await ctx.session
+              .update({ sessionID, metadata: { ...data.metadata, [CLOSE_KEY]: null } as never })
+              .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear close request", error))
+            void closeFromWorker(sessionID, close).catch((error: unknown) =>
+              console.warn(`[${ID}]`, `failed to close ${sessionID}`, error),
+            )
+            continue
+          }
+          if (!data.sessionID || !join || typeof join !== "object") continue
+          const sessionID = data.sessionID
+          // Clear the request first so later metadata updates don't re-add a worker the user forgot.
+          await ctx.session
+            .update({ sessionID, metadata: { ...data.metadata, [JOIN_KEY]: null } as never })
+            .catch((error: unknown) => console.warn(`[${ID}]`, "failed to clear join request", error))
+          void adopt(sessionID, join.why ?? undefined).catch((error: unknown) =>
+            console.warn(`[${ID}]`, `failed to add ${sessionID}`, error),
+          )
         }
       } catch (error) {
         if (!controller.signal.aborted) console.warn(`[${ID}]`, "event stream stopped", error)
@@ -995,16 +716,6 @@ export default Plugin.define({
       await ensureOrchestrator()
     }).catch((error) => console.warn(`[${ID}]`, "failed to start orchestrator session", error))
 
-    void sweep()
-    const timer = options.sweepSeconds > 0 ? setInterval(() => void sweep(), options.sweepSeconds * 1000) : undefined
-
-    const hook = await ctx.session.hook("prompt", (input) => flush(input as never))
-
-    return () => {
-      controller.abort()
-      if (timer) clearInterval(timer)
-      void rpc.dispose()
-      void hook.dispose()
-    }
+    return () => controller.abort()
   },
 })
