@@ -8,7 +8,7 @@ export interface Worker {
   worktree?: string
   /** Root of the worker's worktree checkout (directory may be a subfolder of it). */
   checkout?: string
-  /** Herdr workspace ID the worker's TUI was opened in. */
+  /** herdr app space id (sp…) the worker's TUI was opened in. */
   space?: string
   /** Why the orchestrator started this worker. */
   why?: string

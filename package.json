@@ -1,7 +1,7 @@
 {
   "name": "opencode-orchestrator",
-  "version": "0.3.0",
-  "description": "Pinned OpenCode orchestrator session that spawns worker sessions in herdr worktree spaces and keeps a list of them",
+  "version": "0.4.0",
+  "description": "Pinned OpenCode orchestrator session that spawns worker sessions in herdr desktop app spaces and keeps a list of them",
   "type": "module",
   "license": "MIT",
   "exports": {

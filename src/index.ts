@@ -6,13 +6,12 @@ import {
   branchExists,
   branchOnOrigin,
   checkoutInfo,
+  createWorktree,
   deleteBranch,
   herdr,
   isDirty,
-  paneSession,
   removeGitWorktree,
   resolveBase,
-  type Opened,
 } from "./herdr"
 import { findProjects, gitRoot, slug } from "./projects"
 import { board, checkoutOf, migrate, type Registry, type Worker } from "./registry"
@@ -32,8 +31,10 @@ export interface Options {
   title: string
   /** Give workers spawned inside a git project their own worktree unless the call says otherwise. */
   worktree: boolean
-  /** Herdr binary used to open every worker in its own space, or false to keep workers headless. */
+  /** herdr desktop app CLI (`herdr-app`) used to open every worker in its own space, or false to keep workers headless. */
   herdr: string | false
+  /** herdr-core CLI (`hc`), used to find the space a joining session runs in. */
+  hc: string
   /** Model for workers as "providerID/modelID"; defaults to the model of the session that spawns them. */
   model?: { providerID: string; id: string }
 }
@@ -46,7 +47,7 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
     if (typeof value !== type) throw new Error(`${ID}: option "${key}" must be a ${type}`)
     return value as T
   }
-  const defaultHerdr = process.env.HERDR_BIN_PATH ?? path.join(homedir(), ".local", "bin", "herdr")
+  const bin = path.join(homedir(), ".local", "bin")
   if (options.herdr !== undefined && options.herdr !== false && typeof options.herdr !== "string") {
     throw new Error(`${ID}: option "herdr" must be a string or false`)
   }
@@ -58,7 +59,8 @@ export function parseOptions(raw: unknown, fallbackHome: string): Options {
     home: path.resolve(pick("home", "string", fallbackHome)),
     title: pick("title", "string", "Orchestrator"),
     worktree: pick("worktree", "boolean", true),
-    herdr: (options.herdr as string | false | undefined) ?? defaultHerdr,
+    herdr: (options.herdr as string | false | undefined) ?? path.join(bin, "herdr-app"),
+    hc: pick("hc", "string", path.join(bin, "hc")),
   }
 }
 
@@ -223,7 +225,35 @@ export default Plugin.define({
       return sessionID
     }
 
-    const mux = options.herdr ? herdr(options.herdr) : undefined
+    const mux = options.herdr ? herdr(options.herdr, options.hc) : undefined
+
+    /**
+     * Space ids from the herdr CLI (w53…) mean nothing to the desktop app: find each worker's app space by
+     * folder (its worktree; idea spaces also by name, since the orchestrator's own space shares their
+     * folder) or forget the space. Waits for a run where the app is up.
+     */
+    const migrateSpaces = async () => {
+      const stale = Object.values(registry).filter((worker) => worker.space && !worker.space.startsWith("sp"))
+      if (!stale.length || !mux) return
+      const spaces = await mux.list().catch(() => undefined)
+      if (!spaces) return
+      const claimed = new Set(Object.values(registry).map((worker) => worker.space))
+      for (const worker of stale) {
+        const tree = checkoutOf(worker)
+        const match = spaces.find(
+          (space) =>
+            !claimed.has(space.id) &&
+            !!space.folder &&
+            (tree
+              ? path.resolve(space.folder) === path.resolve(tree)
+              : !worker.project && path.resolve(space.folder) === path.resolve(worker.directory) && space.name === worker.title),
+        )
+        const { space: _old, ...rest } = worker
+        registry[worker.id] = match ? { ...rest, space: match.id } : rest
+        if (match) claimed.add(match.id)
+      }
+      await save()
+    }
 
     const pin = async (sessionID: string) => {
       orchestratorID = sessionID
@@ -268,7 +298,7 @@ export default Plugin.define({
 
     /**
      * Adds a session that joined from inside itself. Repo, branch and worktree come from its folder and
-     * the herdr space from the pane running it; nothing new is created.
+     * the herdr space from the terminal running it (via hc); nothing new is created.
      */
     const adopt = async (sessionID: string, why: string | undefined) => {
       if (sessionID === orchestratorID) throw new Error("that is the orchestrator session itself")
@@ -279,10 +309,8 @@ export default Plugin.define({
       const directory = info.location.directory
       const git = await checkoutInfo(directory)
       const linked = git?.linked && git.branch ? git : undefined
-      const panes = mux && (await mux.available()) ? await mux.panes().catch(() => []) : []
       // A session in a repo's main checkout shares the repo's own space; closing the worker must never close that.
-      const found = panes.find((pane) => paneSession(pane) === sessionID)?.workspace_id
-      const space = linked || !git ? found : undefined
+      const space = (linked || !git) && mux ? await mux.findSession(sessionID).catch(() => undefined) : undefined
       const title = info.title || sessionID
       const reason = why ?? `Joined by the user; continue what "${title}" was doing.`
 
@@ -361,16 +389,10 @@ export default Plugin.define({
 
       const spaces = mux ? await mux.spaces() : undefined
       const space = !!worker.space && !!spaces?.has(worker.space)
-      if (tree) {
-        if (space) {
-          await attempt(`removed worktree and closed herdr space ${worker.space}`, () => mux!.removeWorktree(worker.space!, force))
-        } else {
-          await attempt("removed worktree", () => removeGitWorktree(worker.project!, checkout!, force))
-        }
-      }
-      if (space && !done.some((d) => d.includes(worker.space!))) {
-        await attempt(`closed herdr space ${worker.space}`, () => mux!.closeSpace(worker.space!))
-      }
+      // Close the space first so its shell isn't left sitting in a deleted folder; a space that won't
+      // close keeps its worktree too.
+      if (space) await attempt(`closed herdr space ${worker.space}`, () => mux!.closeSpace(worker.space!))
+      if (tree && !kept.length) await attempt("removed worktree", () => removeGitWorktree(worker.project!, checkout!, force))
       const branch = !!worker.project && !!worker.worktree && (await branchExists(worker.project, worker.worktree))
       if (input.branch === true && branch) {
         await attempt(`deleted branch ${worker.worktree}`, () => deleteBranch(worker.project!, worker.worktree!, force))
@@ -439,7 +461,7 @@ export default Plugin.define({
       editor.add({
         name: "orchestrator_worker_spawn",
         description:
-          "Start a new OpenCode worker for an idea. Inside a project it gets a new branch + worktree opened as a herdr space nested under the repo; otherwise a new herdr space in the orchestrator's folder. Opens in the background and appears on your worker list.",
+          "Start a new OpenCode worker for an idea. Inside a project it gets a branch (new off origin, or an existing local one) + worktree opened as its own herdr space (shown under its repo); otherwise a new herdr space in the orchestrator's folder. Opens in the background and appears on your worker list.",
         input: {
           type: "object",
           properties: {
@@ -455,9 +477,13 @@ export default Plugin.define({
             },
             branch: {
               type: "string",
-              description: "New branch name following the repo convention, e.g. feat/ABC-123-short-description",
+              description:
+                "Branch name following the repo convention, e.g. feat/ABC-123-short-description; an existing local branch is checked out as is",
             },
-            base: { type: "string", description: "Ref to branch from (default develop, or master for hotfix/ branches)" },
+            base: {
+              type: "string",
+              description: "Branch to start a new branch from, always origin/<base> after a fetch (default develop, or master for hotfix/ branches)",
+            },
             worktree: {
               type: "boolean",
               description: `Give a project worker its own branch + worktree (default ${options.worktree}); false works in the checkout`,
@@ -489,33 +515,31 @@ export default Plugin.define({
           const wantTree = (input.worktree as boolean | undefined) ?? (options.worktree && !!root)
           if (wantTree && !root) throw new Error(`a worktree needs a git project; ${target} is not inside one`)
 
-          let branch: string | undefined
-          let base: string | undefined
-          if (wantTree) {
-            branch = str(input.branch, "branch", false) ?? `feat/${slug(title)}`
-            if (await branchExists(root!, branch)) throw new Error(`branch "${branch}" already exists in ${root}`)
-            const explicit = str(input.base, "base", false)
-            const candidates = explicit ? [explicit] : branch.startsWith("hotfix/") ? ["master", "main"] : ["develop", "master", "main"]
-            base = await resolveBase(root!, candidates)
-          }
-
-          // Checked before opening any space so a bad model doesn't leave an empty worktree behind.
+          // Checked before creating anything so a bad model doesn't leave an empty worktree behind.
           const { model, note } = await workerModel(context.sessionID, target)
           const useHerdr = !!mux && (await mux.available())
-          let space: Opened | undefined
+
+          let branch: string | undefined
+          let base: string | undefined
+          let existing = false
+          if (wantTree) {
+            branch = str(input.branch, "branch", false) ?? `feat/${slug(title)}`
+            existing = await branchExists(root!, branch)
+            if (existing && !useHerdr) throw new Error(`branch "${branch}" already exists in ${root}`)
+            const explicit = str(input.base, "base", false)
+            const candidates = explicit ? [explicit] : branch.startsWith("hotfix/") ? ["master", "main"] : ["develop", "master", "main"]
+            if (!existing) base = await resolveBase(root!, candidates, !!explicit)
+          }
+
           let directory = target
           let checkout: string | undefined
           if (useHerdr && branch) {
-            const parent = await mux!.repoSpace(root!).catch(() => undefined)
-            space = await mux!.worktree({ root: root!, space: parent?.workspace_id, branch, base: base!, label: title })
-            checkout = space.directory
-            directory = path.join(space.directory, path.relative(root!, target))
-          } else if (useHerdr) {
-            space = await mux!.workspace({ cwd: target, label: title })
+            checkout = await createWorktree(root!, branch, base)
+            directory = path.join(checkout, path.relative(root!, target))
           }
 
           // Without herdr, fall back to an OpenCode-managed worktree for project workers.
-          const headlessTree = !!branch && !space
+          const headlessTree = !!branch && !useHerdr
           const session = await ctx.session.create({
             title,
             agent,
@@ -530,6 +554,15 @@ export default Plugin.define({
             await ctx.session.move({ sessionID: session.id, directory })
           }
 
+          let space: string | undefined
+          let warning = ""
+          if (useHerdr) {
+            // Named after the title; the sidebar still nests a worktree space under its repo's space.
+            space = await mux!
+              .openSpace({ folder: checkout ?? directory, name: title, argv: ["opencode", "--session", session.id] })
+              .catch((error: unknown) => void (warning = ` Could not open a herdr space: ${String(error).replace(/^Error: /, "")}`))
+          }
+
           await enqueue(async () => {
             registry[session.id] = {
               id: session.id,
@@ -538,7 +571,7 @@ export default Plugin.define({
               project: root,
               worktree: branch,
               checkout,
-              space: space?.workspace,
+              space,
               why,
               created: Date.now(),
             }
@@ -555,24 +588,18 @@ export default Plugin.define({
               branch,
               base,
               directory,
-              space: space?.workspace,
+              space,
               spawned: new Date().toISOString(),
             }),
           })
 
-          let warning = ""
-          if (space) {
-            await mux!
-              .startOpencode({ label: title, pane: space.pane, sessionID: session.id })
-              .catch((error: unknown) => (warning = ` Could not attach OpenCode in herdr ${space!.workspace}: ${error}`))
-          }
           await ctx.session.prompt({ sessionID: session.id, text: prompt })
           await enqueue(publish)
 
           const where = [
-            branch && `branch ${branch} off ${base}`,
+            branch && (existing ? `existing branch ${branch}` : `branch ${branch} off ${base}`),
             directory,
-            space ? `herdr space ${space.workspace}` : !options.herdr ? undefined : "headless (herdr unavailable)",
+            space ? `herdr space ${space}` : !options.herdr || warning ? undefined : "headless (herdr unavailable)",
           ].filter(Boolean)
           return { content: `Spawned worker "${title}" as ${session.id}: ${where.join(", ")}.${note}${warning}` }
         },
@@ -587,7 +614,7 @@ export default Plugin.define({
       editor.add({
         name: "orchestrator_worker_close",
         description:
-          "Close a worker the user is finished with: removes its worktree (closing its herdr space) and optionally its branch and session, then drops it from the list. The result says what is left (e.g. whether the branch is pushed) so you can ask the user. Only call when the user asks.",
+          "Close a worker the user is finished with: closes its herdr space, removes its worktree and optionally its branch and session, then drops it from the list. The result says what is left (e.g. whether the branch is pushed) so you can ask the user. Only call when the user asks.",
         input: {
           type: "object",
           properties: {
@@ -713,6 +740,7 @@ export default Plugin.define({
     })()
 
     void enqueue(async () => {
+      await migrateSpaces().catch((error: unknown) => console.warn(`[${ID}]`, "failed to migrate herdr spaces", error))
       await ensureOrchestrator()
     }).catch((error) => console.warn(`[${ID}]`, "failed to start orchestrator session", error))
 
